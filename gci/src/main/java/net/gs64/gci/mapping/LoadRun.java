@@ -56,7 +56,7 @@ final class LoadRun {
     private final GciTraversalOptions travOptions;
     private Oop root = Oop.ILLEGAL;
     private final List<Oop> toRetain = new ArrayList<>();
-    private final Map<Long, GciObjectReport> reports = new HashMap<>();
+    private final Map<Oop, GciObjectReport> reports = new HashMap<>();
     private final Map<Oop, long[]> flattened = new HashMap<>();
     private final Map<Oop, long[]> dictionaryValues = new HashMap<>();
     /** Values the traversal cannot decode (LargeInteger, ScaledDecimal, date/time …), converted in one batch. */
@@ -100,7 +100,7 @@ final class LoadRun {
                 if (!needsReport(oop, s)) continue;
                 var seen = visited.computeIfAbsent(s, k -> new HashSet<>());
                 if (!seen.add(oop)) continue;
-                var report = reports.get(oop.value());
+                var report = reports.get(oop);
                 if (report == null) {
                     missing.add(oop);
                     seen.remove(oop);
@@ -145,7 +145,7 @@ final class LoadRun {
             if (!missing.isEmpty()) {
                 fetch(missing.toArray(Oop[]::new));
                 for (var o : missing)
-                    if (!reports.containsKey(o.value())) throw GsMappingException.of("The server did not report " + o + ".");
+                    if (!reports.containsKey(o)) throw GsMappingException.of("The server did not report " + o + ".");
             }
             if (!toFlatten.isEmpty()) flatten(toFlatten.toArray(Oop[]::new));
             missing.clear();
@@ -162,7 +162,7 @@ final class LoadRun {
     private void fetch(Oop[] roots) {
         var t = session.traverse(roots, options.depth(), travOptions);
         ctx.lastLoadReports += t.reports().size();
-        for (var r : t.reports()) reports.put(r.oop().value(), r);
+        for (var r : t.reports()) reports.put(r.oop(), r);
     }
 
     /** Server-side asArray / key-value pairs for hashed collections, all in one round trip. */
@@ -173,7 +173,7 @@ final class LoadRun {
             session.storeVaryingOops(array, 1, collections);
             block = session.execute(FLATTEN_BLOCK);
             var t = session.performTraverse(block, "value:", options.depth() + 2, new Oop[] {array}, travOptions);
-            for (var r : t.reports()) reports.putIfAbsent(r.oop().value(), r);
+            for (var r : t.reports()) reports.putIfAbsent(r.oop(), r);
             var flat = t.get(t.result()).indexedValues();
             for (var i = 0; i < collections.length; i++) flattened.put(collections[i], t.get(new Oop(flat[i])).indexedValues());
         } finally {
@@ -262,7 +262,7 @@ final class LoadRun {
     }
 
     private void fill(Object instance, Oop oop, GsTypeMap map) {
-        var report = reports.get(oop.value());
+        var report = reports.get(oop);
         if (map.setOop != null) map.setOop.accept(instance, oop);
         EntityEntry entry = null;
         if (options.trackChanges()) {
@@ -279,7 +279,7 @@ final class LoadRun {
                 value = collection(ivOop, p.shape, p.path, p.collectionKind(), elements);
                 elements.trimToSize(); // kept for the life of the context
                 coll = new CollectionSnapshot(ivOop, elements,
-                        p.shape.kind != ShapeKind.DICTIONARY && ctx.classify(reports.get(ivOop.value()).objectClass()) == CollectionClass.DICTIONARY);
+                        p.shape.kind != ShapeKind.DICTIONARY && ctx.classify(reports.get(ivOop).objectClass()) == CollectionClass.DICTIONARY);
                 toRetain.add(ivOop);
             } else {
                 value = value(ivOop, p.shape, p.path, p);
@@ -300,7 +300,7 @@ final class LoadRun {
     }
 
     private boolean isSymbol(Oop oop) {
-        var r = reports.get(oop.value());
+        var r = reports.get(oop);
         return r != null && (r.objectClass().equals(KnownClasses.SYMBOL) || r.objectClass().equals(KnownClasses.DOUBLE_BYTE_SYMBOL)
                 || r.objectClass().equals(KnownClasses.QUAD_BYTE_SYMBOL));
     }
@@ -342,7 +342,7 @@ final class LoadRun {
 
     @SuppressWarnings("unchecked")
     private Object collection(Oop oop, GsShape shape, String where, GsCollectionKind declared, List<SnapElement> snapshot) {
-        var elements = elements(oop, reports.get(oop.value()), shape, where, declared);
+        var elements = elements(oop, reports.get(oop), shape, where, declared);
         switch (shape.kind) {
             case ARRAY -> {
                 var array = shape.newCollection.apply(elements.length);
@@ -472,7 +472,7 @@ final class LoadRun {
 
     private String describe(Object value) {
         if (value instanceof Oop o) {
-            var r = reports.get(o.value());
+            var r = reports.get(o);
             return "a " + (r != null ? ctx.className(r.objectClass()) : o.toString());
         }
         return value.getClass().getSimpleName() + " " + value;

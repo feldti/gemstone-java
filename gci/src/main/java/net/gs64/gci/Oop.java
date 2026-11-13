@@ -196,6 +196,22 @@ public record Oop(long value) {
         return new ClassCastException(this + " is not a " + kind + ".");
     }
 
+    /**
+     * Mixes all bits: OOPs of heap objects share their low (tag) bits, and with
+     * {@code Long.hashCode} large hash maps of OOPs degenerate into tree bins (a load of 825,000
+     * objects spent most of its time there).
+     */
+    @Override
+    public int hashCode() {
+        var h = value * 0x9E3779B97F4A7C15L;
+        return (int) (h ^ (h >>> 32));
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        return o instanceof Oop other && other.value == value;
+    }
+
     @Override
     public String toString() {
         return "Oop(0x" + Long.toHexString(value).toUpperCase() + ")";

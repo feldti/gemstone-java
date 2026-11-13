@@ -84,7 +84,25 @@ Port von `GciSession.Signals.cs`, `GciSignalListener.cs`, `GciChangeFeed.cs`, `M
 - `GciRepositoryAdmin`: gleiche Methoden, `…Async` liefern `GciFuture`; Zeiten als `Instant`.
 - Gegentests: Signalisieren dauerhaft an → `aSignalAndACommitArrivingTogether` 4× rot; kein Klingeln nach `saveChangesAndCommit` → `theReplicaFollowsAMappedWriter` rot. (Den Fehler-6010-Pfad abzuschalten bleibt grün: Bei abgeschaltetem Signalisieren kommen Signale nie als Fehler, sondern über die Queue.)
 
+## Samples (`samples`, artifactId `gs64-samples`)
+
+```bash
+mvn -q -B -DskipTests package          # baut auch samples/target/lib (Laufzeit-Klassenpfad)
+R="$JAVA_HOME/bin/java --enable-native-access=ALL-UNNAMED -Xmx8g -cp samples/target/classes:samples/target/lib/*"
+GS_STONE=test376 GS_GEM_SERVICE='!@localhost#netldi:39857!gemnetobject' GS_PASSWORD=swordfish $R net.gs64.samples.GsRepl
+$R net.gs64.samples.GsRepl -e "3 + 4"
+$R net.gs64.samples.ReplicaBench setup        # gleiche Daten und Namen wie der C#-Benchmark (GemStoneGciBench_Root, Bench*)
+$R net.gs64.samples.ReplicaBench 2            # zwei Runden laden, getrackt und ungetrackt
+$R net.gs64.samples.ReplicaBench bigsave 15000
+$R net.gs64.samples.ReplicaBench cleanup
+```
+
+- `GsRepl`: wie die C#-REPL (`:commit`, `:abort`, `:q`, `\` am Zeilenende). Ctrl+C = Soft Break über `sun.misc.Signal`, **per Reflection** aufgerufen: der direkte Aufruf erzeugt eine nicht unterdrückbare javac-Warnung („interne proprietäre API“), und das Modul baut mit `-Werror`. Zum Testen per `kill -INT`: ein aus einer nicht interaktiven Shell mit `&` gestarteter Prozess ignoriert SIGINT (`SigIgn` 0x2 in `/proc/<pid>/status`), dann greift kein Handler; mit `signal.SIG_DFL` neu starten.
+- `ReplicaBench` nutzt die erzeugten Metadaten (Processor mit `proc full` im Modul; die Registry landet in `net.gs64.samples`).
+- **Messung (3.7.6 lokal, 825.001 Objekte, 2026-11-13):** getrackt 5,5–6,4 s (C#: 5,2 s), ungetrackt 4,1–4,3 s (C#: 3,6 s), Heap 695 / 270 MB (C#: 549 / 242 MB), GC 0,3–0,4 s, 2.688 GCI-Aufrufe. `bigsave 15000` (615.501 neue Objekte): Anlegen 5,8 s (C#: 9,9 s), `saveChanges` ohne Änderungen 0,5 s (C#: 0,9 s), Commit 0,4 s.
+- **Gefunden mit JFR** (`-XX:StartFlightRecording=…,settings=profile`, `jfr print --events jdk.ExecutionSample`): Vorher 9,8 / 7,0 s, fast alles in `HashMap$TreeNode`. OOPs von Heap-Objekten haben gleiche untere Bits, `Long.hashCode` und der Record-`hashCode` mischen nicht, große Tabellen entarteten zu Baum-Buckets. Jetzt `Oop.hashCode` mit Fibonacci-Mischung und Report-Tabellen mit `Oop`- statt `Long`-Schlüsseln (`GciTraversal.decode` nimmt `Map<Oop, GciObjectReport>`). Test: `OopTest.hashCodesOfHeapOopsSpread`.
+
 ## Stand
 
 - Kern, Store-Traversal, Objekt-Mapping, Annotation-Processor, Signale, Change-Feed, Replikat und Repository-Verwaltung fertig: 352 Tests grün auf 3.6.5 (test365) und 3.7.6 (test376). test368/372/375 liefen beim letzten Lauf nicht (Fehler 4042 beim Login, `gslist` zeigt sie nicht).
-- Noch offen: Samples (REPL, Benchmark), Messung großer Kontexte, GraalVM native-image, Tests auf 3.6.8/3.7.2/3.7.5 und unter Windows/arm64.
+- Noch offen: GraalVM native-image, Tests auf 3.6.8/3.7.2/3.7.5 und unter Windows/arm64.

@@ -80,4 +80,17 @@ class OopTest {
         assertNull(Oop.tryFromSmallDouble(Double.NaN));
         assertNull(Oop.tryFromSmallDouble(Double.POSITIVE_INFINITY));
     }
+
+    /** Heap OOPs share their low bits; the hash must spread them anyway (HashMap uses the low bits). */
+    @Test
+    void hashCodesOfHeapOopsSpread() {
+        var buckets = new java.util.HashSet<Integer>();
+        for (var i = 0; i < 4096; i++) {
+            var h = new Oop(0x7000001L + 256L * i).hashCode();
+            buckets.add((h ^ (h >>> 16)) & 1023); // what a HashMap with 1024 buckets uses
+        }
+        assertTrue(buckets.size() > 900, buckets.size() + " of 1024 buckets used");
+        assertEquals(new Oop(42), new Oop(42));
+        assertEquals(new Oop(42).hashCode(), new Oop(42).hashCode());
+    }
 }

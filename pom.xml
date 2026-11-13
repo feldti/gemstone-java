@@ -25,6 +25,7 @@
   <modules>
     <module>gci-processor</module>
     <module>gci</module>
+    <module>samples</module>
   </modules>
 
   <properties>

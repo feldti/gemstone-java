@@ -23,7 +23,7 @@ public final class GciTraversal {
     private final List<Oop> roots;
     private final Oop result;
     private final List<GciObjectReport> reports;
-    private Map<Long, GciObjectReport> byOop;
+    private Map<Oop, GciObjectReport> byOop;
 
     GciTraversal(List<Oop> roots, Oop result, List<GciObjectReport> reports) {
         this.roots = List.copyOf(roots);
@@ -35,11 +35,11 @@ public final class GciTraversal {
             this.reports = reports;
             return;
         }
-        var map = new HashMap<Long, GciObjectReport>(reports.size() * 2);
-        var position = new HashMap<Long, Integer>();
+        var map = new HashMap<Oop, GciObjectReport>(reports.size() * 2);
+        var position = new HashMap<Oop, Integer>();
         var ordered = new ArrayList<GciObjectReport>(reports.size());
         for (var r : reports) {
-            var key = r.oop().value();
+            var key = r.oop();
             var existing = map.get(key);
             if (existing != null) {
                 var merged = existing.mergeWith(r);
@@ -55,10 +55,10 @@ public final class GciTraversal {
         this.reports = ordered;
     }
 
-    private Map<Long, GciObjectReport> byOop() {
+    private Map<Oop, GciObjectReport> byOop() {
         if (byOop == null) {
-            var map = new HashMap<Long, GciObjectReport>(reports.size() * 2);
-            for (var r : reports) map.put(r.oop().value(), r);
+            var map = new HashMap<Oop, GciObjectReport>(reports.size() * 2);
+            for (var r : reports) map.put(r.oop(), r);
             byOop = map;
         }
         return byOop;
@@ -80,19 +80,19 @@ public final class GciTraversal {
     }
 
     public boolean contains(Oop oop) {
-        return byOop().containsKey(oop.value());
+        return byOop().containsKey(oop);
     }
 
     /** The report of {@code oop}. */
     public GciObjectReport get(Oop oop) {
-        var r = byOop().get(oop.value());
+        var r = byOop().get(oop);
         if (r == null) throw new NoSuchElementException(oop + " is not part of this traversal.");
         return r;
     }
 
     /** The report of {@code oop}, or null. */
     public GciObjectReport find(Oop oop) {
-        return byOop().get(oop.value());
+        return byOop().get(oop);
     }
 
     /**
@@ -106,13 +106,13 @@ public final class GciTraversal {
     }
 
     /** The offline decoder behind {@link #toValue}, for reports collected from several traversals (keyed by OOP value). */
-    public static Object decode(Oop oop, Map<Long, GciObjectReport> reports) {
+    public static Object decode(Oop oop, Map<Oop, GciObjectReport> reports) {
         if (oop.isNil()) return null;
         if (oop.isBoolean()) return oop.toBoolean();
         if (oop.isSmallInteger()) return oop.toSmallInteger();
         if (oop.isSmallDouble()) return oop.toSmallDouble();
         if (oop.isCharacter()) return new CodePoint(oop.toCharacter());
-        var r = reports.get(oop.value());
+        var r = reports.get(oop);
         if (r == null || r.isPartial() || r.format() != GciObjectFormat.BYTE) return oop;
         var bytes = r.bytes();
         var c = r.objectClass();
@@ -128,9 +128,9 @@ public final class GciTraversal {
     }
 
     /** Whether {@link #decode} would answer a value rather than the {@link Oop} itself, without decoding it. */
-    public static boolean canDecode(Oop oop, Map<Long, GciObjectReport> reports) {
+    public static boolean canDecode(Oop oop, Map<Oop, GciObjectReport> reports) {
         if (oop.isNil() || oop.isBoolean() || oop.isSmallInteger() || oop.isSmallDouble() || oop.isCharacter()) return true;
-        var r = reports.get(oop.value());
+        var r = reports.get(oop);
         if (r == null || r.isPartial() || r.format() != GciObjectFormat.BYTE) return false;
         var c = r.objectClass();
         return c.equals(KnownClasses.STRING) || c.equals(KnownClasses.SYMBOL) || c.equals(KnownClasses.UNICODE7)
