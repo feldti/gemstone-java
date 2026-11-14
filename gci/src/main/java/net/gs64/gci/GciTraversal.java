@@ -1,6 +1,5 @@
 package net.gs64.gci;
 
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -18,7 +17,6 @@ import java.util.NoSuchElementException;
  * {@link GciTraversalOptions#keepResult()}) or commit them.
  */
 public final class GciTraversal {
-    private static final Charset UTF_32LE = Charset.forName("UTF-32LE");
 
     private final List<Oop> roots;
     private final Oop result;
@@ -121,10 +119,21 @@ public final class GciTraversal {
         if (c.equals(KnownClasses.UTF8)) return new String(bytes, StandardCharsets.UTF_8);
         if (c.equals(KnownClasses.UNICODE16) || c.equals(KnownClasses.DOUBLE_BYTE_STRING) || c.equals(KnownClasses.DOUBLE_BYTE_SYMBOL))
             return new String(bytes, StandardCharsets.UTF_16LE);
-        if (c.equals(KnownClasses.UNICODE32) || c.equals(KnownClasses.QUAD_BYTE_SYMBOL)) return new String(bytes, UTF_32LE);
+        if (c.equals(KnownClasses.UNICODE32) || c.equals(KnownClasses.QUAD_BYTE_SYMBOL)) return utf32le(bytes);
         if (c.equals(KnownClasses.BYTE_ARRAY)) return bytes.clone();
         if (c.equals(KnownClasses.FLOAT) && bytes.length == 8) return java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).getDouble();
         return oop;
+    }
+
+    /**
+     * UTF-32 in client byte order (little endian). Decoded by hand: the charset is not one of the
+     * standard charsets, and a GraalVM native image leaves it out unless built with all charsets.
+     */
+    static String utf32le(byte[] bytes) {
+        var sb = new StringBuilder(bytes.length / 4);
+        for (var i = 0; i + 3 < bytes.length; i += 4)
+            sb.appendCodePoint((bytes[i] & 0xFF) | (bytes[i + 1] & 0xFF) << 8 | (bytes[i + 2] & 0xFF) << 16 | (bytes[i + 3] & 0xFF) << 24);
+        return sb.toString();
     }
 
     /** Whether {@link #decode} would answer a value rather than the {@link Oop} itself, without decoding it. */

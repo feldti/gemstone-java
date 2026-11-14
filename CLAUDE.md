@@ -102,7 +102,24 @@ $R net.gs64.samples.ReplicaBench cleanup
 - **Messung (3.7.6 lokal, 825.001 Objekte, 2026-11-13):** getrackt 5,5–6,4 s (C#: 5,2 s), ungetrackt 4,1–4,3 s (C#: 3,6 s), Heap 695 / 270 MB (C#: 549 / 242 MB), GC 0,3–0,4 s, 2.688 GCI-Aufrufe. `bigsave 15000` (615.501 neue Objekte): Anlegen 5,8 s (C#: 9,9 s), `saveChanges` ohne Änderungen 0,5 s (C#: 0,9 s), Commit 0,4 s.
 - **Gefunden mit JFR** (`-XX:StartFlightRecording=…,settings=profile`, `jfr print --events jdk.ExecutionSample`): Vorher 9,8 / 7,0 s, fast alles in `HashMap$TreeNode`. OOPs von Heap-Objekten haben gleiche untere Bits, `Long.hashCode` und der Record-`hashCode` mischen nicht, große Tabellen entarteten zu Baum-Buckets. Jetzt `Oop.hashCode` mit Fibonacci-Mischung und Report-Tabellen mit `Oop`- statt `Long`-Schlüsseln (`GciTraversal.decode` nimmt `Map<Oop, GciObjectReport>`). Test: `OopTest.hashCodesOfHeapOopsSpread`.
 
+## GraalVM native-image
+
+GraalVM CE 25.5.5.0.3 (JDK 25.0.5) liegt unter `~/.local/graalvm/graalvm-community-25.5.5.0.3+1.1` (nur Serial-GC, kein PGO).
+
+```bash
+G=$(ls -d ~/.local/graalvm/graalvm-*)
+mvn -q -B -DskipTests package
+cd samples && $G/bin/native-image -cp "target/classes:$(ls target/lib/*.jar | tr '\n' ':')" net.gs64.samples.ReplicaBench -o target/replicabench
+# Metadaten neu erfassen (nach neuen GCI-Funktionen): mit dem Agenten auf der GraalVM-JVM laufen lassen
+$G/bin/java -agentlib:native-image-agent=config-merge-dir=/tmp/ni-config --enable-native-access=ALL-UNNAMED -cp … net.gs64.samples.ReplicaBench 1
+```
+
+- Die Bibliothek bringt ihre Metadaten mit: `gci/src/main/resources/META-INF/native-image/net.gs64/gs64-gci/reachability-metadata.json` (alle 42 Downcall-Signaturen von `GciNative`; vom Agenten erfasst, der Agent sieht sie alle, weil der statische Initialisierer alle Handles anlegt) und `native-image.properties` (`-H:+UnlockExperimentalVMOptions -H:+ForeignAPISupport --enable-native-access=ALL-UNNAMED`). native-image liest beides aus der JAR; die Anwendung braucht keine eigenen Optionen. **Eine neue Funktion in `GciNative` mit neuer Signatur muss dort nachgetragen werden**, sonst scheitert das native Image beim Anlegen des Handles.
+- Mit `GsGeneratedMappings` braucht das Mapping keine Reflection (der Agent fand nur einen JDK-Eintrag für Datumsformate). Der Reflection-Provider bräuchte dagegen Metadaten für alle gemappten Klassen.
+- `UTF-32LE` ist kein Standard-Zeichensatz und fehlt in nativen Images (`UnsupportedCharsetException` beim Laden von `GciTraversal`): wird jetzt von Hand dekodiert (`GciTraversal.utf32le`).
+- Messung (3.7.6 lokal): `gsrepl -e` 0,07 s und 22 MB statt 0,23 s und 96 MB auf der JVM; Ctrl+C geht auch nativ. Großer Graph (825.001 Objekte) dagegen langsamer: getrackt 11,5–17,4 s (mit `-Xmn3g` 10 s), ungetrackt 6,7–8,9 s, `bigsave 15000` 15,2 s statt 5,8 s, fast alles GC-Zeit des Serial-GC; Heap kleiner (523 / 211 MB statt 695 / 270 MB). Für große Kontexte also die JVM; Oracle GraalVM (G1, PGO) nicht getestet.
+
 ## Stand
 
 - Kern, Store-Traversal, Objekt-Mapping, Annotation-Processor, Signale, Change-Feed, Replikat und Repository-Verwaltung fertig: 352 Tests grün auf 3.6.5 (test365) und 3.7.6 (test376). test368/372/375 liefen beim letzten Lauf nicht (Fehler 4042 beim Login, `gslist` zeigt sie nicht).
-- Noch offen: GraalVM native-image, Tests auf 3.6.8/3.7.2/3.7.5 und unter Windows/arm64.
+- Noch offen: Tests auf 3.6.8/3.7.2/3.7.5 und unter Windows/arm64.
