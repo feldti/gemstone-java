@@ -37,11 +37,16 @@ public final class GciChangeFeed {
             consumers := RcKeyValueDictionary new""",
         """
         publish: objects
-            "Add the changed objects to every consumer's queue; call it in the writer's transaction, before the commit."
-            | entry |
+            "Add the changed objects to every consumer's queue; call it in the writer's transaction, before the commit.
+             A consumer registered with skipOwn: true gets nothing its own session publishes."
+            | entry own |
             objects isEmpty ifTrue: [^self].
             entry := objects asArray.
-            consumers do: [:e | (e at: 1) add: entry]""",
+            own := GsSession serialOfSession: System session.
+            consumers do: [:e | (self skips: e serial: own) ifFalse: [(e at: 1) add: entry]]""",
+        """
+        skips: e serial: own
+            ^e size >= 3 and: [(e at: 3) == true and: [(e at: 2) = own]]""",
         """
         publishWrittenObjects: aBlock
             "Publish the persistent objects this transaction has written so far (System _writtenObjects,
@@ -65,18 +70,26 @@ public final class GciChangeFeed {
         """
         ring
             "After the commit: wake up the consumers' listener sessions."
+            | own |
+            own := GsSession serialOfSession: System session.
             consumers do: [:e | | sid |
-                sid := GsSession sessionIdOfSerial: (e at: 2).
+                sid := (self skips: e serial: own) ifTrue: [nil] ifFalse: [GsSession sessionIdOfSerial: (e at: 2)].
                 (sid notNil and: [sid > 0]) ifTrue: [
                     [System sendSignal: 7301 to: sid withMessage: 'GciChangeFeed'] on: Error do: [:x | x return: nil]]]""",
         """
         register: key serial: serial
-            "Create the consumer's queue (or keep it) and remember the serial number of its listener session."
+            ^self register: key serial: serial skipOwn: false""",
+        """
+        register: key serial: serial skipOwn: aBoolean
+            "Create the consumer's queue (or keep it) and remember the serial number of its listener session.
+             skipOwn: true - publishes of that session itself do not go into this queue (and do not ring it):
+             a consumer that is also a writer already has its own changes."
             | e |
             e := consumers at: key ifAbsent: [nil].
-            e isNil
-                ifTrue: [consumers at: key put: (Array with: RcQueue new with: serial)]
-                ifFalse: [e at: 2 put: serial]""",
+            e isNil ifTrue: [^consumers at: key put: (Array with: RcQueue new with: serial with: aBoolean)].
+            e size < 3
+                ifTrue: [consumers at: key put: (Array with: (e at: 1) with: serial with: aBoolean)]
+                ifFalse: [e at: 2 put: serial; at: 3 put: aBoolean]""",
         """
         unregister: key
             consumers removeKey: key ifAbsent: [nil]""",
@@ -205,7 +218,22 @@ public final class GciChangeFeed {
      * @param listenerSessionId session id of the consumer's {@link GciSignalListener}, which gets the doorbell
      */
     public void register(String consumer, long listenerSessionId) {
-        session.send(feed, "register:serial:", consumer, session.evaluate("GsSession serialOfSession: " + listenerSessionId, Long.class));
+        register(consumer, listenerSessionId, false);
+    }
+
+    /**
+     * Registers a consumer (or updates an existing one). Commit afterwards.
+     *
+     * @param consumer key of the consumer, stable across restarts
+     * @param listenerSessionId session id of the session that gets the doorbell: the consumer's
+     *     {@link GciSignalListener}, or the consumer's own session ({@link net.gs64.gci.mapping.GsChangeSync})
+     * @param skipOwnPublishes what the session {@code listenerSessionId} publishes itself does not go
+     *     into this consumer's queue and does not ring it: for a consumer that is also a writer and
+     *     already has its own changes (one session per client)
+     */
+    public void register(String consumer, long listenerSessionId, boolean skipOwnPublishes) {
+        session.send(feed, "register:serial:skipOwn:", consumer,
+                session.evaluate("GsSession serialOfSession: " + listenerSessionId, Long.class), skipOwnPublishes);
     }
 
     /** Removes a consumer and its queue. Commit afterwards. */

@@ -281,6 +281,7 @@ final class LoadRun {
                 coll = new CollectionSnapshot(ivOop, elements,
                         p.shape.kind != ShapeKind.DICTIONARY && ctx.classify(reports.get(ivOop).objectClass()) == CollectionClass.DICTIONARY);
                 toRetain.add(ivOop);
+                ctx.rememberCollectionOwner(ivOop, instance);
             } else {
                 value = value(ivOop, p.shape, p.path, p);
                 if (entry == null && p.shape.isCollection() && !ivOop.isSpecial()) ctx.rememberCollectionOwner(ivOop, instance);

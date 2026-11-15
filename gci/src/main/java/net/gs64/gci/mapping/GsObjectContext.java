@@ -77,8 +77,14 @@ public final class GsObjectContext implements AutoCloseable {
     private String clampSpecSelector;
     /** Object reports the traversals of the last load or refresh delivered (for tests and measurements). */
     long lastLoadReports;
-    /** Objects loaded without tracking: lets refresh find the owner of a reported collection. */
-    final Map<Oop, List<Object>> untrackedCollectionOwners = new HashMap<>();
+    /**
+     * Collection OOP -> the object that holds it in a field (or a {@code List} of several), as
+     * loaded: lets refresh find the owner of a reported collection without scanning every
+     * snapshot (825,000 tracked objects: ~130 ms per refresh). Entries may be stale (a collection
+     * replaced later): that only refreshes an owner needlessly. Nested and newly saved collections
+     * are not in it; refresh scans the snapshots for those.
+     */
+    final Map<Oop, Object> collectionOwnerIndex = new HashMap<>();
     private final Map<Oop, String> classNames = new HashMap<>();
     boolean ownRoot;
 
@@ -207,6 +213,18 @@ public final class GsObjectContext implements AutoCloseable {
      */
     public List<Object> refresh(Collection<Oop> oopsToRefresh, GsLoadOptions options) {
         var opts = options == null ? GsLoadOptions.DEFAULT : options;
+        var result = refreshTargets(oopsToRefresh);
+        if (result.isEmpty()) return List.of();
+        var roots = new ArrayList<LoadRun.Root>();
+        for (var e : result) roots.add(new LoadRun.Root(oopOf(e), prepare(e.getClass()), e.getClass().getSimpleName() + " " + oopOf(e)));
+        var run = new LoadRun(this, opts, false);
+        run.discover(roots);
+        run.build(roots);
+        return result;
+    }
+
+    /** The loaded objects a refresh of these OOPs would load again (each once). */
+    List<Object> refreshTargets(Collection<Oop> oopsToRefresh) {
         var result = new ArrayList<Object>();
         var seen = java.util.Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
         Map<Oop, List<Object>> owners = null;
@@ -216,20 +234,38 @@ public final class GsObjectContext implements AutoCloseable {
                 for (var e : instances(found)) if (seen.add(e)) result.add(e);
                 continue;
             }
-            var untracked = untrackedCollectionOwners.get(oop);
-            if (untracked != null) for (var e : untracked) if (seen.add(e)) result.add(e);
+            var indexed = collectionOwnerIndex.get(oop);
+            if (indexed != null) {
+                for (var e : owners(indexed)) if (seen.add(e)) result.add(e);
+                continue;
+            }
             if (entries.isEmpty()) continue;
             if (owners == null) owners = collectionOwners();
             var collectionOwners = owners.get(oop);
             if (collectionOwners != null) for (var e : collectionOwners) if (seen.add(e)) result.add(e);
         }
-        if (result.isEmpty()) return List.of();
-        var roots = new ArrayList<LoadRun.Root>();
-        for (var e : result) roots.add(new LoadRun.Root(oopOf(e), prepare(e.getClass()), e.getClass().getSimpleName() + " " + oopOf(e)));
-        var run = new LoadRun(this, opts, false);
-        run.discover(roots);
-        run.build(roots);
         return result;
+    }
+
+    /**
+     * The mapped objects the tracked owners hold in their collections (also nested ones), as of
+     * their snapshots. Untracked owners contribute nothing.
+     */
+    java.util.Set<Object> collectionElements(Collection<Object> owners) {
+        var elements = java.util.Collections.newSetFromMap(new IdentityHashMap<Object, Boolean>());
+        for (var owner : owners) {
+            var entry = entries.get(owner);
+            if (entry == null) continue;
+            for (var snap : entry.snapshots()) if (snap.collection != null) addElements(snap.collection, elements);
+        }
+        return elements;
+    }
+
+    private static void addElements(CollectionSnapshot c, java.util.Set<Object> elements) {
+        for (var e : c.elements) {
+            if (e.nested() != null) addElements(e.nested(), elements);
+            else if (e.value() != null && isEntity(e.value())) elements.add(e.value());
+        }
     }
 
     /** {@link #refresh(Collection, GsLoadOptions)} with default options. */
@@ -253,8 +289,24 @@ public final class GsObjectContext implements AutoCloseable {
     }
 
     void rememberCollectionOwner(Oop collection, Object owner) {
-        var list = untrackedCollectionOwners.computeIfAbsent(collection, k -> new ArrayList<>());
-        if (list.stream().noneMatch(o -> o == owner)) list.add(owner);
+        var known = collectionOwnerIndex.get(collection);
+        if (known == null) collectionOwnerIndex.put(collection, owner); // usually one owner: no list
+        else if (known instanceof OwnerList list) { if (list.stream().noneMatch(o -> o == owner)) list.add(owner); }
+        else if (known != owner) {
+            var list = new OwnerList();
+            list.add(known);
+            list.add(owner);
+            collectionOwnerIndex.put(collection, list);
+        }
+    }
+
+    /** Several owners of one collection (an own type: an owner could be a List itself). */
+    private static final class OwnerList extends ArrayList<Object> {
+        private static final long serialVersionUID = 1L;
+    }
+
+    private static List<Object> owners(Object indexed) {
+        return indexed instanceof OwnerList list ? list : List.of(indexed);
     }
 
     Oop oopOf(Object entity) {
@@ -630,7 +682,7 @@ public final class GsObjectContext implements AutoCloseable {
         clampSpec = Oop.ILLEGAL;
         entries.clear();
         identity.clear();
-        untrackedCollectionOwners.clear();
+        collectionOwnerIndex.clear();
         oops.clear();
         forgetJournal();
         recheck.clear();
