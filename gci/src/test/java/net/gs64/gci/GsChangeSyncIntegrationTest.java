@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -19,6 +20,8 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import net.gs64.gci.GciChangeFeedIntegrationTest.FeedItem;
 import net.gs64.gci.mapping.GsChangeSync;
+import net.gs64.gci.mapping.GsClass;
+import net.gs64.gci.mapping.GsInstVar;
 import net.gs64.gci.mapping.GsObjectContext;
 import net.gs64.gci.mapping.GsUnsavedChangesException;
 
@@ -127,6 +130,98 @@ class GsChangeSyncIntegrationTest {
             b.context.saveChangesAndCommit();
             seesNewClients(a);
             assertEquals("Fritz", a.root.name);
+        }
+    }
+
+    @GsClass("GsSyncTestNode")
+    static final class Node {
+        @GsInstVar("name") String name;
+        @GsInstVar("parent") Node parent;
+        @GsInstVar("children") List<Node> children = new ArrayList<>();
+
+        Node() {
+        }
+
+        Node(String name, Node parent) {
+            this.name = name;
+            this.parent = parent;
+        }
+    }
+
+    /**
+     * Every node points back to the root (bidirectional associations): a refresh must stop at the
+     * objects the context already holds, otherwise refreshing one node reloads the whole graph.
+     */
+    @StoneTest
+    void aRefreshStopsAtObjectsTheContextAlreadyHolds() throws Exception {
+        var graph = "(UserGlobals at: #" + key + "Graph)";
+        sa.abort();
+        sa.execute("""
+                | c root |
+                c := Object subclass: 'GsSyncTestNode' instVarNames: #('name' 'parent' 'children') classVars: #()
+                    classInstVars: #() poolDictionaries: #() inDictionary: UserGlobals.
+                root := c new instVarNamed: 'name' put: 'root'; instVarNamed: 'children' put: OrderedCollection new; yourself.
+                1 to: 2000 do: [:i | | n | n := c new instVarNamed: 'name' put: i printString; instVarNamed: 'parent' put: root;
+                    instVarNamed: 'children' put: OrderedCollection new; yourself.
+                    (root instVarNamed: 'children') add: n].
+                UserGlobals at: #%sGraph put: root.
+                true
+                """.formatted(key));
+        sa.commit();
+
+        GsObjectContext aCtx = null, bCtx = null;
+        GsChangeSync aSync = null, bSync = null;
+        try {
+            sa.abort();
+            var aFeed = new GciChangeFeed(sa, feedName);
+            aCtx = new GsObjectContext(sa);
+            aCtx.setChangeFeed(aFeed);
+            aSync = new GsChangeSync(aCtx, aFeed, "A");
+            aSync.setFullCheckInterval(Duration.ofHours(1));
+            aSync.register();
+            var aRoot = aCtx.load(graph, Node.class);
+
+            sb.abort();
+            var bFeed = new GciChangeFeed(sb, feedName);
+            bCtx = new GsObjectContext(sb);
+            bCtx.setChangeFeed(bFeed);
+            bSync = new GsChangeSync(bCtx, bFeed, "B");
+            bSync.setFullCheckInterval(Duration.ofHours(1));
+            bSync.register();
+            var bRoot = bCtx.load(graph, Node.class);
+
+            var until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (!aSync.poll().rang()) {
+                if (System.nanoTime() > until) throw new AssertionError("The registration did not ring within 5 seconds.");
+                Thread.sleep(5);
+            }
+            var bFirst = bRoot.children.get(0);
+            var bSecond = bRoot.children.get(1);
+
+            // Changed on the server, but not published: a refresh that stops at known objects leaves it alone.
+            sa.execute("((" + graph + " instVarNamed: 'children') at: 2) instVarNamed: 'name' put: 'silent'. true");
+            aRoot.children.get(0).name = "first";
+            aRoot.children.add(new Node("new", aRoot));
+            aCtx.saveChangesAndCommit();
+
+            var r = bSync.poll();
+            assertEquals("first", bFirst.name);
+            assertEquals("2", bSecond.name); // not published: not reloaded
+            assertEquals(2001, bRoot.children.size());
+            assertEquals(1, r.added().size());
+            var added = (Node) r.added().get(0);
+            assertEquals("new", added.name);
+            assertSame(bRoot, added.parent); // the new node's reference to a known object
+            assertSame(bRoot, bFirst.parent);
+            assertTrue(bCtx.lastLoadReports() < 100, bCtx.lastLoadReports() + " reports for 2 published objects.");
+        } finally {
+            if (aSync != null) aSync.close();
+            if (aCtx != null) aCtx.close();
+            if (bSync != null) bSync.close();
+            if (bCtx != null) bCtx.close();
+            sa.abort();
+            sa.execute("UserGlobals removeKey: #" + key + "Graph ifAbsent: [nil]; removeKey: #GsSyncTestNode ifAbsent: [nil]. true");
+            sa.commit();
         }
     }
 

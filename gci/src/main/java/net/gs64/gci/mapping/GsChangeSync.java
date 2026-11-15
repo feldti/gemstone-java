@@ -70,6 +70,7 @@ public final class GsChangeSync implements AutoCloseable {
     private long lastFullCheck = System.nanoTime();
     private volatile Duration fullCheckInterval = Duration.ofSeconds(30);
     private volatile int reloadThreshold = 50_000;
+    private volatile GsLoadOptions refreshOptions = GsLoadOptions.DEFAULT.withStopAtLoadedObjects(true).withDepth(2);
     private volatile Consumer<Result> onChanged;
     private volatile Consumer<Exception> onError;
     private boolean retake;                 // a take was not committed (failure): take again without a doorbell
@@ -100,6 +101,16 @@ public final class GsChangeSync implements AutoCloseable {
     /** More published objects than this in one take: {@link Result#reloadRequired} instead of a refresh. Default 50,000. */
     public void setReloadThreshold(int threshold) {
         reloadThreshold = threshold;
+    }
+
+    /**
+     * How the published objects are loaded again. Default: {@link GsLoadOptions#stopAtLoadedObjects}
+     * (only the published objects and objects new to the context are read; references to objects
+     * the context holds are linked) and traversal depth 2. Every client publishes each object it
+     * changed, so nothing beyond them has to be read.
+     */
+    public void setRefreshOptions(GsLoadOptions options) {
+        refreshOptions = Objects.requireNonNull(options);
     }
 
     /**
@@ -190,7 +201,7 @@ public final class GsChangeSync implements AutoCloseable {
                 try {
                     var owners = context.refreshTargets(published);
                     var before = context.collectionElements(owners);
-                    refreshed = context.refresh(published);
+                    refreshed = context.refresh(published, refreshOptions);
                     var after = context.collectionElements(refreshed);
                     var a = new ArrayList<Object>();
                     for (var e : after) if (!before.contains(e)) a.add(e);

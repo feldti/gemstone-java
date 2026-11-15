@@ -77,6 +77,11 @@ public final class GsObjectContext implements AutoCloseable {
     private String clampSpecSelector;
     /** Object reports the traversals of the last load or refresh delivered (for tests and measurements). */
     long lastLoadReports;
+
+    /** Object reports the last load or refresh read from the server (diagnostics). */
+    public long lastLoadReports() {
+        return lastLoadReports;
+    }
     /**
      * Collection OOP -> the object that holds it in a field (or a {@code List} of several), as
      * loaded: lets refresh find the owner of a reported collection without scanning every

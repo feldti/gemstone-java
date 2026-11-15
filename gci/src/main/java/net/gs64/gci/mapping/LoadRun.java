@@ -90,11 +90,13 @@ final class LoadRun {
         var stack = new ArrayDeque<Node>();
         var blocked = new ArrayList<Node>();
         for (var r : roots) stack.push(new Node(r.oop(), r.shape(), r.where()));
+        if (options.stopAtLoadedObjects()) for (var r : roots) rootOops.add(r.oop());
         while (true) {
             while (!stack.isEmpty()) {
                 var node = stack.pop();
                 var oop = node.oop();
                 var s = node.shape();
+                if (isLoadedElsewhere(oop, s)) continue;
                 if ((s.kind == ShapeKind.SCALAR || s.kind == ShapeKind.OBJECT) && oop.isSpecial() && !GciTraversal.canDecode(oop, reports))
                     toConvert.add(oop); // SmallScaledDecimal, SmallDate, SmallDateAndTime …
                 if (!needsReport(oop, s)) continue;
@@ -327,9 +329,19 @@ final class LoadRun {
         };
     }
 
+    /** Roots of the load (filled even if known), with {@link GsLoadOptions#stopAtLoadedObjects}. */
+    private final Set<Oop> rootOops = new HashSet<>();
+
+    /** With {@link GsLoadOptions#stopAtLoadedObjects}: a mapped object the context holds and that is not a root. */
+    private boolean isLoadedElsewhere(Oop oop, GsShape shape) {
+        return options.stopAtLoadedObjects() && shape.kind == ShapeKind.MAPPED && !oop.isSpecial()
+                && !rootOops.contains(oop) && ctx.find(oop, shape.map.type) != null;
+    }
+
     private Object instance(Oop oop, GsTypeMap map) {
         var existing = ctx.find(oop, map.type);
         if (existing != null) {
+            if (options.stopAtLoadedObjects() && !rootOops.contains(oop)) return existing; // linked, not reloaded
             if (filled.add(existing)) fill.add(new Job(existing, oop, map)); // loaded again: refresh
             return existing;
         }
