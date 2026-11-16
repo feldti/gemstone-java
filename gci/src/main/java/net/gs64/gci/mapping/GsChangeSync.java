@@ -10,6 +10,7 @@ import java.util.function.Consumer;
 
 import net.gs64.gci.GciChangeFeed;
 import net.gs64.gci.GciException;
+import net.gs64.gci.GciTransactionConflictException;
 import net.gs64.gci.Oop;
 
 /**
@@ -47,7 +48,9 @@ public final class GsChangeSync implements AutoCloseable {
      * @param added mapped objects now in a collection of a refreshed object that were not before
      * @param removed mapped objects that were in a collection of a refreshed object and are no
      *     longer: candidates for deletion in application caches
-     * @param reloadRequired more than the reload threshold was published: nothing was refreshed, reload
+     * @param reloadRequired nothing was refreshed, the application reloads: more than the reload
+     *     threshold was published, or this client's entry in the feed was gone (removed as absent or
+     *     unregistered by someone else) and changes may have been missed; the poll registered it again
      * @param takeTime abort and take
      * @param refreshTime the refresh
      * @param commitTime committing the take
@@ -70,6 +73,8 @@ public final class GsChangeSync implements AutoCloseable {
     private long lastFullCheck = System.nanoTime();
     private volatile Duration fullCheckInterval = Duration.ofSeconds(30);
     private volatile int reloadThreshold = 50_000;
+    private volatile Duration expireAbsentConsumersAfter = Duration.ofMinutes(10);
+    private long expiredConsumers;
     private volatile GsLoadOptions refreshOptions = GsLoadOptions.DEFAULT.withStopAtLoadedObjects(true).withDepth(2);
     private volatile Consumer<Result> onChanged;
     private volatile Consumer<Exception> onError;
@@ -101,6 +106,51 @@ public final class GsChangeSync implements AutoCloseable {
     /** More published objects than this in one take: {@link Result#reloadRequired} instead of a refresh. Default 50,000. */
     public void setReloadThreshold(int threshold) {
         reloadThreshold = threshold;
+    }
+
+    /**
+     * Consumers of the feed whose session is no longer logged in (a crashed client, a key that does
+     * not come back) and that have neither registered nor taken anything for this long are removed
+     * with their queues at {@link #register} and at every full check; otherwise their queues keep
+     * collecting and keep the published objects alive. A running client is never removed. Default
+     * 10 minutes; {@code null} turns it off. Do not share the feed with consumers that are meant to
+     * collect while not running.
+     */
+    public void setExpireAbsentConsumersAfter(Duration after) {
+        expireAbsentConsumersAfter = after;
+    }
+
+    /** Consumers this sync removed from the feed. */
+    public synchronized long expiredConsumers() {
+        return expiredConsumers;
+    }
+
+    private int expireAbsentConsumers() {
+        var after = expireAbsentConsumersAfter;
+        if (after == null) return 0;
+        var gone = feed.expireAbsentConsumers(after).size();
+        synchronized (this) {
+            expiredConsumers += gone;
+        }
+        return gone;
+    }
+
+    /**
+     * Removes this client from the feed and commits: call it at a normal logout, while idle (it
+     * aborts first). Stops background polling. A client that crashes is removed later by the others.
+     */
+    public void unregister() {
+        if (closed) throw new IllegalStateException("The sync is closed.");
+        stop();
+        synchronized (polling) {
+            var session = context.session();
+            for (var attempt = 1; ; attempt++) {
+                session.abort();
+                feed.unregister(consumer);
+                if (session.tryCommit()) return;
+                if (attempt == 3) throw new GciTransactionConflictException("Unregistering the consumer conflicted three times.");
+            }
+        }
     }
 
     /**
@@ -151,6 +201,7 @@ public final class GsChangeSync implements AutoCloseable {
     public void register() {
         var session = context.session();
         feed.register(consumer, session.gemSessionId(), true);
+        expireAbsentConsumers();
         session.commit();
         try {
             feed.ring();
@@ -180,7 +231,8 @@ public final class GsChangeSync implements AutoCloseable {
             }
             var session = context.session();
             var rang = session.evaluate(DRAIN_SOURCE, Long.class) > 0;
-            if (!rang && !force && !retake && System.nanoTime() - lastFullCheck < fullCheckInterval.toNanos()) return Result.NOTHING;
+            var fullCheck = force || System.nanoTime() - lastFullCheck >= fullCheckInterval.toNanos();
+            if (!rang && !fullCheck && !retake) return Result.NOTHING;
             synchronized (this) {
                 takes++;
             }
@@ -188,15 +240,28 @@ public final class GsChangeSync implements AutoCloseable {
             lastFullCheck = System.nanoTime();
             var t0 = System.nanoTime();
             session.abort();                            // see what the others committed
+            var expired = 0;
+            var lost = false;
+            if (fullCheck) {
+                expired = expireAbsentConsumers();
+                // Our own entry is gone (removed by someone else): whatever was published meanwhile
+                // is lost. Register again and have the application reload.
+                if (!feed.isRegistered(consumer)) {
+                    feed.register(consumer, session.gemSessionId(), true);
+                    lost = true;
+                }
+            }
             var oops = feed.take(consumer);
             var t1 = System.nanoTime();
-            if (oops.length == 0) {
+            if (oops.length == 0 && !lost) {
+                // Removed consumers: commit that; a conflict only means someone else removed them too.
+                if (expired > 0 && !session.tryCommit()) session.abort();
                 retake = false;
                 return rang ? Result.RANG_FOR_NOTHING : Result.NOTHING;
             }
             var published = List.of(oops);
             List<Object> refreshed = List.of(), added = List.of(), removed = List.of();
-            var reload = oops.length > reloadThreshold;
+            var reload = lost || oops.length > reloadThreshold;
             if (!reload) {
                 try {
                     var owners = context.refreshTargets(published);
@@ -295,7 +360,7 @@ public final class GsChangeSync implements AutoCloseable {
         stopping = false;
     }
 
-    /** Stops polling. The consumer stays registered; see {@link GciChangeFeed#unregister}. */
+    /** Stops polling. The consumer stays registered; see {@link #unregister}. */
     @Override
     public void close() {
         if (closed) return;

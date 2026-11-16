@@ -22,7 +22,10 @@ import java.util.Objects;
  * {@code feed commitPublishingWrittenObjects: [:o | o isModelObject]} publishes what the
  * transaction has written (the dirty list, {@code System _writtenObjects}), commits and rings.
  *
- * <p>A consumer that is no longer needed must be unregistered, otherwise its queue keeps growing.
+ * <p>A consumer that is no longer needed must be unregistered, otherwise its queue keeps growing
+ * (and keeps the published objects alive, also objects long removed from the database). For
+ * consumers that do not come back (a crashed client), {@link #expireAbsentConsumers} removes those
+ * whose listener session is gone; {@link net.gs64.gci.mapping.GsChangeSync} does that by itself.
  */
 public final class GciChangeFeed {
     /** Signal value sent by {@link #ring()}. */
@@ -86,20 +89,45 @@ public final class GciChangeFeed {
              a consumer that is also a writer already has its own changes."
             | e |
             e := consumers at: key ifAbsent: [nil].
-            e isNil ifTrue: [^consumers at: key put: (Array with: RcQueue new with: serial with: aBoolean)].
-            e size < 3
-                ifTrue: [consumers at: key put: (Array with: (e at: 1) with: serial with: aBoolean)]
-                ifFalse: [e at: 2 put: serial; at: 3 put: aBoolean]""",
+            e isNil ifTrue: [^consumers at: key put: (Array with: RcQueue new with: serial with: aBoolean with: System timeGmt)].
+            e size < 4
+                ifTrue: [consumers at: key put: (Array with: (e at: 1) with: serial with: aBoolean with: System timeGmt)]
+                ifFalse: [e at: 2 put: serial; at: 3 put: aBoolean; at: 4 put: System timeGmt]""",
+        """
+        includesConsumer: key
+            ^consumers includesKey: key""",
+        """
+        isListening: e
+            "Whether the consumer's listener session is logged in."
+            | sid |
+            sid := GsSession sessionIdOfSerial: (e at: 2).
+            ^sid notNil and: [sid > 0]""",
+        """
+        expireAbsentFor: seconds
+            "Remove the consumers whose listener session is no longer logged in and that have neither
+             registered nor taken anything for seconds (entries without a time count as old).
+             Answer their keys. Their queues and the objects in them are released."
+            | now gone |
+            now := System timeGmt.
+            gone := Array new.
+            consumers keysAndValuesDo: [:k :e | | t |
+                t := e size >= 4 ifTrue: [e at: 4] ifFalse: [0].
+                (now - t >= seconds and: [(self isListening: e) not]) ifTrue: [gone add: k]].
+            gone do: [:k | consumers removeKey: k ifAbsent: [nil]].
+            ^gone""",
         """
         unregister: key
             consumers removeKey: key ifAbsent: [nil]""",
         """
         take: key
             "Remove and answer everything published for this consumer (each object once)."
-            | e result |
+            | e q result |
             e := consumers at: key ifAbsent: [^#()].
+            q := e at: 1.
+            q isEmpty ifTrue: [^#()].
+            e size >= 4 ifTrue: [e at: 4 put: System timeGmt].
             result := IdentitySet new.
-            (e at: 1) removeAll do: [:entry | result addAll: entry].
+            q removeAll do: [:entry | result addAll: entry].
             ^result asArray""",
         """
         pendingFor: key
@@ -239,6 +267,31 @@ public final class GciChangeFeed {
     /** Removes a consumer and its queue. Commit afterwards. */
     public void unregister(String consumer) {
         session.send(feed, "unregister:", consumer);
+    }
+
+    /** Whether {@code consumer} is registered (in this session's view). */
+    public boolean isRegistered(String consumer) {
+        return session.send(Boolean.class, feed, "includesConsumer:", consumer);
+    }
+
+    /**
+     * Removes the consumers whose listener session is no longer logged in and that have neither
+     * registered nor taken anything for {@code absentFor}, with their queues (the objects in them
+     * are released). A running consumer is never removed. Commit afterwards. A removed key that
+     * comes back registers anew and must reload.
+     *
+     * @return the removed keys
+     */
+    public List<String> expireAbsentConsumers(java.time.Duration absentFor) {
+        if (absentFor.isNegative()) throw new IllegalArgumentException("absentFor must not be negative.");
+        var array = session.perform(feed, "expireAbsentFor:", Oop.fromSmallInteger(absentFor.toSeconds()));
+        try {
+            var result = new ArrayList<String>();
+            for (var k : session.toList(array)) result.add((String) k);
+            return result;
+        } finally {
+            session.release(array);
+        }
     }
 
     /**

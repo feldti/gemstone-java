@@ -133,6 +133,81 @@ class GsChangeSyncIntegrationTest {
         }
     }
 
+    /** Registers {@code consumer} for a session that then logs out (a crashed client). */
+    private void registerGoneConsumer(String consumer, boolean withoutTime) throws InterruptedException {
+        long serial;
+        try (var gone = StoneEnv.login()) {
+            serial = gone.evaluate("GsSession serialOfSession: " + gone.gemSessionId(), Long.class);
+            sa.abort();
+            if (withoutTime) // an entry from before expiry existed
+                sa.execute("((UserGlobals at: #" + feedName + ") instVarNamed: 'consumers') at: '" + consumer + "' put: "
+                        + "(Array with: RcQueue new with: " + serial + " with: true). true");
+            else
+                new GciChangeFeed(sa, feedName).register(consumer, gone.gemSessionId(), true);
+            sa.execute("(UserGlobals at: #" + feedName + ") publish: {" + item() + "}. true"); // its queue holds an object
+            sa.commit();
+        }
+        // The stone notices the logout asynchronously.
+        var until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (sa.evaluate("(GsSession sessionIdOfSerial: " + serial + ") ifNil: [0]", Long.class) > 0) {
+            if (System.nanoTime() > until) throw new AssertionError("The session did not go away within 5 seconds.");
+            Thread.sleep(20);
+        }
+    }
+
+    @StoneTest
+    void consumersOfSessionsThatAreGoneExpire() throws Exception {
+        registerGoneConsumer("gone", false);
+        registerGoneConsumer("old", true);
+        try (var b = new Client(sb, "B")) { // registers B: expiry with grace 10 min
+            var feed = new GciChangeFeed(sa, feedName);
+            sa.abort();
+            assertEquals(List.of("B", "gone"), feed.consumers().stream().sorted().toList()); // "old" had no time: gone at once
+            assertEquals(1, b.sync.expiredConsumers()); // removed by B's registration
+
+            assertTrue(feed.expireAbsentConsumers(Duration.ofHours(1)).isEmpty()); // within the grace time
+            assertEquals(List.of("gone"), feed.expireAbsentConsumers(Duration.ZERO)); // B is logged in: never
+            sa.commit();
+            assertEquals(List.of("B"), feed.consumers());
+        }
+    }
+
+    @StoneTest
+    void aFullCheckExpiresConsumersThatAreGone() throws Exception {
+        registerGoneConsumer("gone", false);
+        try (var b = new Client(sb, "B")) { // registering keeps it: within the grace time
+            b.sync.setExpireAbsentConsumersAfter(Duration.ZERO);
+            assertTrue(b.sync.poll().isEmpty()); // no full check: nothing removed
+            assertTrue(b.sync.poll(true).isEmpty());
+            assertEquals(1, b.sync.expiredConsumers());
+            sa.abort();
+            assertEquals(List.of("B"), new GciChangeFeed(sa, feedName).consumers()); // committed
+        }
+    }
+
+    @StoneTest
+    void aClientWhoseEntryIsGoneRegistersAgainAndReloads() {
+        try (var b = new Client(sb, "B")) {
+            sa.abort();
+            new GciChangeFeed(sa, feedName).unregister("B");
+            sa.commit();
+
+            assertTrue(b.sync.poll(true).reloadRequired());
+            sa.abort();
+            assertTrue(new GciChangeFeed(sa, feedName).isRegistered("B"));
+            assertFalse(b.sync.poll(true).reloadRequired());
+        }
+    }
+
+    @StoneTest
+    void unregisterRemovesTheClient() {
+        try (var b = new Client(sb, "B")) {
+            b.sync.unregister();
+            sa.abort();
+            assertFalse(new GciChangeFeed(sa, feedName).isRegistered("B"));
+        }
+    }
+
     @GsClass("GsSyncTestNode")
     static final class Node {
         @GsInstVar("name") String name;
