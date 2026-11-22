@@ -324,11 +324,25 @@ final class SaveRun {
         stores++;
     }
 
+    private static boolean isEmpty(Object collection) {
+        if (collection instanceof java.util.Collection<?> c) return c.isEmpty();
+        if (collection instanceof java.util.Map<?, ?> m) return m.isEmpty();
+        if (collection.getClass().isArray()) return java.lang.reflect.Array.getLength(collection) == 0;
+        return !((Iterable<?>) collection).iterator().hasNext();
+    }
+
     private void updateCollection(SaveTarget target, GsPropertyMap p, Object current, PropertySnapshot snap, Remember remember) {
         var old = snap == null ? null : snap.collection;
         if (current == null) {
             if (snap == null || !snap.oop.isNil()) store(target, p, BatchValue.of(Oop.NIL));
             remember.snapshot(p, () -> new PropertySnapshot(Oop.NIL));
+            return;
+        }
+        if (old == null && ctx.emptyCollectionsAsNil() && isEmpty(current)) {
+            // Empty stays nil on the server; a new object gets nil instead of a new collection.
+            if (snap != null && snap.oop.isNil()) return;
+            store(target, p, BatchValue.of(Oop.NIL));
+            remember.snapshot(p, () -> new PropertySnapshot(Oop.NIL, current, null, false, true));
             return;
         }
         if (old != null) {
@@ -772,7 +786,10 @@ final class SaveRun {
             ops.add(new PublishOp(feed, changed.stream().map(BatchValue::of).toList()));
             onSuccess.add(ctx::ringAfterCommit);
         }
-        if (!ops.isEmpty()) send();
+        if (!ops.isEmpty()) {
+            ctx.checkCancelled(); // last point where nothing has happened yet
+            send();
+        }
         for (var action : onSuccess) action.run();
         for (var s : scalarSnapshots) {
             var entry = s.target().entry();

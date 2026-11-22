@@ -92,6 +92,22 @@ public final class GciSession implements AutoCloseable {
             public Map<String, Object> attachments(GciSession session) {
                 return session.attachments();
             }
+
+            @Override
+            public GciTraversal traverse(GciSession session, Oop[] roots, int level, GciTraversalOptions options,
+                                         java.util.function.BiConsumer<List<GciObjectReport>, Integer> onReports) {
+                return session.traverse(roots, level, options, onReports::accept);
+            }
+
+            @Override
+            public long traversalWaitNanos(GciSession session) {
+                return locked(() -> session.traversalWaitNanos);
+            }
+
+            @Override
+            public boolean holdsLock() {
+                return SYNC.isHeldByCurrentThread();
+            }
         });
     }
 
@@ -180,6 +196,7 @@ public final class GciSession implements AutoCloseable {
     public void close() {
         SYNC.lock();
         try {
+            awaitSessionFree(); // a call of this session waiting with the lock released: let it finish
             if (!loggedIn) return;
             switchTo();
             if (nbInProgress) finishPendingNonblockingCall();
@@ -230,6 +247,7 @@ public final class GciSession implements AutoCloseable {
      */
     void activate() {
         callCount++;
+        awaitSessionFree(); // another thread waits for a call of this session with the lock released
         switchTo();
         if (nbInProgress)
             throw new IllegalStateException(
@@ -1466,24 +1484,38 @@ public final class GciSession implements AutoCloseable {
 
     /** {@link #traverse(Oop, int, GciTraversalOptions)} for several roots. */
     public GciTraversal traverse(Oop[] roots, int level, GciTraversalOptions options) {
+        return traverse(roots, level, options, null);
+    }
+
+    /**
+     * {@link #traverse(Oop[], int, GciTraversalOptions)} that hands the reports of each buffer to
+     * {@code onReports} (the list and the index of the first new report) while the gem fills the
+     * next buffer. Nonblocking: the GCI lock is free while the gem works.
+     */
+    GciTraversal traverse(Oop[] roots, int level, GciTraversalOptions options, ReportsListener onReports) {
         if (level < 0) throw new IllegalArgumentException("level must not be negative.");
         var opts = options == null ? GciTraversalOptions.DEFAULT : options;
         return locked(() -> {
             try (var arena = Arena.ofConfined(); var buffer = new TravBuffer(opts.bufferSize())) {
                 var rootSeg = oops(arena, roots);
                 activate();
-                boolean done;
+                var args = clampedArgs(arena, buffer.segment(), level);
                 if (opts.clampSpec() != null) {
-                    var args = clampedArgs(arena, buffer.segment(), level);
                     args.set(JAVA_LONG, 0, opts.clampSpec().value());
-                    done = GciNative.GciClampedTrav(rootSeg, roots.length, args);
+                    GciNative.GciNbClampedTrav(rootSeg, roots.length, args);
                 } else {
-                    done = GciNative.GciTraverseObjs(rootSeg, roots.length, buffer.segment(), level);
+                    GciNative.GciNbTraverseObjs(rootSeg, roots.length, buffer.segment(), level);
                 }
-                throwIfError();
-                return new GciTraversal(Arrays.asList(roots), null, collectAll(buffer, done));
+                var done = endNonblockingBool();
+                return new GciTraversal(Arrays.asList(roots), null, collectAll(buffer, done, onReports));
             }
         });
+    }
+
+    /** Receives the reports of one traversal buffer: {@code reports} from index {@code first} on are new. */
+    @FunctionalInterface
+    interface ReportsListener {
+        void accept(List<GciObjectReport> reports, int first);
     }
 
     /**
@@ -1513,10 +1545,10 @@ public final class GciSession implements AutoCloseable {
                 var travArgs = clampedArgs(arena, buffer.segment(), level);
                 var argv = args.length == 0 ? arena.allocateFrom(JAVA_LONG, Oop.NIL.value()) : oops(arena, args);
                 activate();
-                var done = GciNative.GciPerformTrav(receiver.value(), selector, argv, args.length, travArgs);
-                throwIfError();
+                GciNative.GciNbPerformTrav(receiver.value(), selector, argv, args.length, travArgs);
+                var done = endNonblockingBool();
                 var result = new Oop(travArgs.get(JAVA_LONG, 8));
-                var traversal = new GciTraversal(List.of(result), result, collectAll(buffer, done));
+                var traversal = new GciTraversal(List.of(result), result, collectAll(buffer, done, null));
                 if (!opts.keepResult()) release(result); // GciPerformTrav exports the result
                 return traversal;
             }
@@ -1606,16 +1638,173 @@ public final class GciSession implements AutoCloseable {
         return args;
     }
 
-    /** Copies the reports of the current buffer, then continues with GciMoreTraversal until done. */
-    List<GciObjectReport> collectAll(TravBuffer buffer, boolean done) {
+    /**
+     * Copies the reports of the current buffer, then continues until done. Double-buffered:
+     * GciNbMoreTraversal lets the gem fill a second buffer while the reports of the first are
+     * copied (and handed to {@code onReports}), so the copying overlaps with the server's work.
+     */
+    List<GciObjectReport> collectAll(TravBuffer buffer, boolean done, ReportsListener onReports) {
         var reports = new ArrayList<GciObjectReport>();
-        while (true) {
+        if (done) {
             buffer.readReports(reports);
-            if (done) return reports;
-            activate();
-            done = GciNative.GciMoreTraversal(buffer.segment());
-            throwIfError();
+            if (onReports != null) onReports.accept(reports, 0);
+            return reports;
         }
+        try (var second = new TravBuffer(buffer.bodySize())) {
+            var current = buffer;
+            var next = second;
+            while (!done) {
+                activate();
+                GciNative.GciNbMoreTraversal(next.segment());
+                try {
+                    var first = reports.size();
+                    current.readReports(reports);
+                    if (onReports != null) onReports.accept(reports, first);
+                } catch (Throwable t) {
+                    drainNonblocking(); // the gem is still writing into the buffer
+                    throw t;
+                }
+                done = endNonblockingBool();
+                var swap = current;
+                current = next;
+                next = swap;
+            }
+            var last = reports.size();
+            current.readReports(reports);
+            if (onReports != null) onReports.accept(reports, last);
+            return reports;
+        }
+    }
+
+    /** Nanoseconds this session's traversals waited for the gem (guarded by SYNC). */
+    long traversalWaitNanos;
+
+    /** The thread waiting in {@link #waitReleasingLock} for this session's call (guarded by SYNC). */
+    private Thread waitingThread;
+
+    /** Condition for threads that want this session while another one waits for it with the lock released. */
+    private static final java.util.concurrent.locks.Condition SESSION_FREE = SYNC.newCondition();
+
+    /**
+     * Waits for a nonblocking call that answers a BoolType (under the lock, session current;
+     * returns the same way). The GCI lock is free while the gem works.
+     */
+    private boolean endNonblockingBool() {
+        return endNonblocking() != 0;
+    }
+
+    /** Waits for a nonblocking call and answers its raw result (BoolType, OOP); errors of the call are thrown. */
+    private long endNonblocking() {
+        try (var arena = Arena.ofConfined()) {
+            var out = arena.allocate(JAVA_LONG);
+            var start = System.nanoTime();
+            var status = waitReleasingLock(out);
+            traversalWaitNanos += System.nanoTime() - start;
+            var value = out.get(JAVA_LONG, 0);
+            if (status == GciNative.NB_HAS_ERROR || value == 0 || value == Oop.NIL.value()) throwIfError();
+            if (status == GciNative.NB_HAS_ERROR) throw new GciException("The nonblocking call failed without an error report.");
+            return value;
+        }
+    }
+
+    /**
+     * Waits for this session's running nonblocking call without holding the GCI lock: other
+     * sessions (on other threads) can make calls while the gem works. Called under the lock with
+     * the session current; the lock is released completely (also if the caller holds it several
+     * times) and taken back as often, with the session current again. Meanwhile, other threads
+     * that want this session wait in {@link #activate} instead of failing.
+     */
+    private int waitReleasingLock(MemorySegment out) {
+        var status = GciNative.GciNbEndPoll(out, 0);
+        if (status != GciNative.NB_NOT_READY && status != GciNative.NB_PROGRESSED) return status;
+        var handle = GciNative.GciNbGetNotifyHandle();
+        waitingThread = Thread.currentThread();
+        try {
+            while (true) {
+                var held = SYNC.getHoldCount();
+                for (var i = 0; i < held; i++) SYNC.unlock();
+                try {
+                    if (handle < 0 || GciNative.GciPollSocketForRead(handle, SOCKET_WAIT_SLICE_MS) < 0) {
+                        handle = -1; // no handle, or polling failed: wait a little
+                        java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+                    }
+                } finally {
+                    for (var i = 0; i < held; i++) SYNC.lock();
+                }
+                switchTo();
+                status = GciNative.GciNbEndPoll(out, 0);
+                if (status != GciNative.NB_NOT_READY && status != GciNative.NB_PROGRESSED) return status;
+            }
+        } finally {
+            waitingThread = null;
+            SESSION_FREE.signalAll();
+        }
+    }
+
+    /** Lets a started nonblocking call finish after a client-side failure; its result and error are dropped. */
+    private void drainNonblocking() {
+        try (var arena = Arena.ofConfined()) {
+            var out = arena.allocate(JAVA_LONG);
+            int status;
+            do {
+                status = GciNative.GciNbEndPoll(out, 1000);
+            } while (status == GciNative.NB_NOT_READY || status == GciNative.NB_PROGRESSED);
+        }
+        lastError();
+    }
+
+    /** Waits (under the lock) while another thread waits for a call of this session with the lock released. */
+    private void awaitSessionFree() {
+        while (waitingThread != null && waitingThread != Thread.currentThread()) SESSION_FREE.awaitUninterruptibly();
+    }
+
+    /**
+     * Round trip below which the stone counts as local (same machine): measured (C#) 0.015 ms on
+     * loopback, 0.064 ms across a gigabit LAN, 0.28 ms between servers in a data centre. 0.05 ms,
+     * not 0.04 ms as in C#: a fresh JVM measures 0.034–0.036 ms on loopback (see {@link #roundTrip}).
+     */
+    public static final java.time.Duration LOCAL_ROUND_TRIP_LIMIT = java.time.Duration.ofNanos(50_000);
+
+    private java.time.Duration roundTrip;
+    private int preferredBufferSize;
+
+    /**
+     * The shortest of some GCI round trips ({@code execute("nil")}), measured once per session on
+     * first use: for 5 ms (at least 5, at most 200 calls). Not just 5 calls as in C#: in a fresh JVM
+     * the first calls run interpreted and take about 50 µs on loopback (later 16–20 µs), which looked
+     * like a network.
+     */
+    public java.time.Duration roundTrip() {
+        return locked(() -> {
+            if (roundTrip == null) {
+                var best = Long.MAX_VALUE;
+                var until = System.nanoTime() + 5_000_000;
+                for (var i = 0; i < 200 && (i < 5 || System.nanoTime() < until); i++) {
+                    var start = System.nanoTime();
+                    execute("nil");
+                    best = Math.min(best, System.nanoTime() - start);
+                }
+                roundTrip = java.time.Duration.ofNanos(best);
+            }
+            return roundTrip;
+        });
+    }
+
+    /**
+     * Traversal buffer size for this session: {@link GciTraversalOptions#DEFAULT_BUFFER_SIZE}
+     * (64 KB) if the stone is local ({@link #roundTrip} below {@link #LOCAL_ROUND_TRIP_LIMIT}),
+     * otherwise {@link GciTraversalOptions#NETWORK_BUFFER_SIZE} (1 MB). On one machine, traversals
+     * with buffers of 128 KB or more stall about 40 ms per buffer (probably TCP delayed ACK on
+     * loopback); across a network the larger buffer saves round trips. Used by object-mapper loads
+     * unless their buffer size is set.
+     */
+    public int preferredTraversalBufferSize() {
+        return locked(() -> {
+            if (preferredBufferSize == 0)
+                preferredBufferSize = roundTrip().compareTo(LOCAL_ROUND_TRIP_LIMIT) < 0
+                        ? GciTraversalOptions.DEFAULT_BUFFER_SIZE : GciTraversalOptions.NETWORK_BUFFER_SIZE;
+            return preferredBufferSize;
+        });
     }
 
     /** A GciTravBufType in native memory: header {uint allocatedBytes; uint usedBytes;} + body. */
@@ -1640,6 +1829,10 @@ public final class GciSession implements AutoCloseable {
 
         MemorySegment segment() {
             return segment;
+        }
+
+        int bodySize() {
+            return bodySize;
         }
 
         private void reset() {
@@ -1777,12 +1970,15 @@ public final class GciSession implements AutoCloseable {
                 writeReport(buffer, at, o);
                 at += o.reportBytes();
             }
+            // Nonblocking, so that the GCI lock is free while the gem works (a large batch takes seconds).
             return locked(() -> {
                 activate();
-                GciNative.GciStoreTrav(buffer, GCI_STORE_TRAV_CREATE);
+                GciNative.GciNbStoreTrav(buffer, GCI_STORE_TRAV_CREATE);
+                endNonblocking();
                 throwIfError();
                 activate();
-                return checkResult(GciNative.GciExecuteStrFromContext(source, context.value(), Oop.NIL.value()));
+                GciNative.GciNbExecuteStrFromContext(source, context.value(), Oop.NIL.value());
+                return checkResult(endNonblocking());
             });
         }
     }
@@ -1912,15 +2108,23 @@ public final class GciSession implements AutoCloseable {
     /** How long one wait for the socket lasts before cancellation is checked again, in ms. */
     private static final int SOCKET_WAIT_SLICE_MS = 50;
 
+    /**
+     * Platform threads that wait for sockets (a native wait would pin a virtual thread's carrier);
+     * kept for a minute, so that a series of short asynchronous calls does not start a thread each.
+     */
+    private static final java.util.concurrent.ExecutorService WAITERS = new java.util.concurrent.ThreadPoolExecutor(
+            0, Integer.MAX_VALUE, 60, java.util.concurrent.TimeUnit.SECONDS, new java.util.concurrent.SynchronousQueue<>(),
+            Thread.ofPlatform().daemon().name("gci-wait-", 0).factory());
+
     enum ResultKind { OOP, BOOL, VOID }
 
     /** {@link #execute(String)} without blocking the GCI; {@link GciFuture#cancel} sends a soft break. */
     public GciFuture<Oop> executeAsync(String source) {
         Objects.requireNonNull(source, "source");
         if (isAscii(source))
-            return startNonblocking(() -> GciNative.GciNbExecuteStr(source, Oop.NIL.value()), ResultKind.OOP, null, false).map(Oop::new);
+            return startNonblocking(() -> GciNative.GciNbExecuteStr(source, Oop.NIL.value()), ResultKind.OOP, null, true).map(Oop::new);
         var sourceObj = newUnicode(source);
-        var future = startNonblocking(() -> GciNative.GciNbExecute(sourceObj.value(), Oop.NIL.value()), ResultKind.OOP, null, false);
+        var future = startNonblocking(() -> GciNative.GciNbExecute(sourceObj.value(), Oop.NIL.value()), ResultKind.OOP, null, true);
         future.whenComplete((r, e) -> {
             if (isLoggedIn()) release(sourceObj);
         });
@@ -1931,7 +2135,7 @@ public final class GciSession implements AutoCloseable {
     public GciFuture<Oop> performAsync(Oop receiver, String selector, Oop... args) {
         Objects.requireNonNull(selector, "selector");
         var copy = args.clone();
-        return startNonblocking(() -> startPerform(receiver, selector, copy), ResultKind.OOP, null, false).map(Oop::new);
+        return startNonblocking(() -> startPerform(receiver, selector, copy), ResultKind.OOP, null, true).map(Oop::new);
     }
 
     /** {@link #evaluate(String)} asynchronously. */
@@ -1969,7 +2173,7 @@ public final class GciSession implements AutoCloseable {
 
     /** {@link #tryCommit} asynchronously; false on a conflict. Not cancellable once started. */
     public GciFuture<Boolean> tryCommitAsync() {
-        return startNonblocking(GciNative::GciNbCommit, ResultKind.BOOL, null, false).map(v -> {
+        return startNonblocking(GciNative::GciNbCommit, ResultKind.BOOL, null, true).map(v -> {
             if (v == 0) return false;
             locked(() -> onTransactionEnded(true));
             return true;
@@ -1995,7 +2199,7 @@ public final class GciSession implements AutoCloseable {
     }
 
     private GciFuture<Void> transactionEndAsync(Runnable start) {
-        var future = startNonblocking(start, ResultKind.VOID, null, false);
+        var future = startNonblocking(start, ResultKind.VOID, null, true);
         var result = new GciFuture<Void>(); // not cancellable: an abort is not interrupted
         // The listeners run before the result completes (as for the synchronous abort).
         future.whenComplete((v, e) -> {
@@ -2030,9 +2234,10 @@ public final class GciSession implements AutoCloseable {
      *
      * @param capture if set, signals that make the call fail (6008/6010) are captured and the call repeated
      * @param waitOnSocket wait for the session's socket (GciNbGetNotifyHandle + GciPollSocketForRead,
-     *     outside the lock) instead of polling with a growing delay: no CPU while waiting, for long
-     *     calls such as the signal listener's wait. The poller is then a platform thread (the
-     *     native wait would pin a virtual thread's carrier).
+     *     outside the lock) instead of polling with a growing delay: no CPU while waiting, and the
+     *     result is picked up as soon as it arrives (a short call costs about as much as its
+     *     synchronous form). All asynchronous calls do this. The poller is then a platform thread
+     *     from {@link #WAITERS} (the native wait would pin a virtual thread's carrier).
      */
     GciFuture<Long> startNonblocking(Runnable start, ResultKind kind, SignalCapture capture, boolean waitOnSocket) {
         var future = new GciFuture<Long>();
@@ -2051,7 +2256,7 @@ public final class GciSession implements AutoCloseable {
                 future.completeExceptionally(t);
             }
         };
-        if (waitOnSocket) Thread.ofPlatform().daemon().name("gci-wait-" + sessionId).start(poll);
+        if (waitOnSocket) WAITERS.execute(poll);
         else Thread.ofVirtual().name("gci-poll-" + sessionId).start(poll);
         return future;
     }

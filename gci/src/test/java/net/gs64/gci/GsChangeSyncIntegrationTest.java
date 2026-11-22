@@ -22,6 +22,7 @@ import net.gs64.gci.GciChangeFeedIntegrationTest.FeedItem;
 import net.gs64.gci.mapping.GsChangeSync;
 import net.gs64.gci.mapping.GsClass;
 import net.gs64.gci.mapping.GsInstVar;
+import net.gs64.gci.mapping.GsLoadOptions;
 import net.gs64.gci.mapping.GsObjectContext;
 import net.gs64.gci.mapping.GsUnsavedChangesException;
 
@@ -220,6 +221,36 @@ class GsChangeSyncIntegrationTest {
         Node(String name, Node parent) {
             this.name = name;
             this.parent = parent;
+        }
+    }
+
+    /**
+     * The gem expands a root only where it first reaches it: with the child first, the owner is
+     * reached from the child one level down, and its children collection comes in a later round.
+     */
+    @StoneTest
+    void aRefreshOfAnOwnerAndAChildStopsAtKnownObjectsInEitherOrder() {
+        sa.abort();
+        var rootOop = sa.execute("""
+                | c root |
+                c := Object subclass: 'GsSyncTestNode' instVarNames: #('name' 'parent' 'children') classVars: #()
+                    classInstVars: #() poolDictionaries: #() inDictionary: UserGlobals.
+                root := c new instVarNamed: 'name' put: 'root'; instVarNamed: 'children' put: OrderedCollection new; yourself.
+                1 to: 2000 do: [:i | (root instVarNamed: 'children') add: (c new instVarNamed: 'name' put: i printString;
+                    instVarNamed: 'parent' put: root; instVarNamed: 'children' put: OrderedCollection new; yourself)].
+                root
+                """);
+        try (var ctx = new GsObjectContext(sa)) {
+            var root = ctx.load(rootOop, Node.class);
+            var child = ctx.oopFor(root.children.get(0));
+            var options = GsLoadOptions.DEFAULT.withStopAtLoadedObjects(true).withDepth(2);
+            for (var order : List.of(List.of(rootOop, child), List.of(child, rootOop))) {
+                assertEquals(2, ctx.refresh(order, options).size());
+                assertTrue(ctx.lastLoadReports() < 100, ctx.lastLoadReports() + " reports (" + ctx.lastLoad() + ")");
+            }
+        } finally {
+            sa.release(rootOop);
+            sa.abort();
         }
     }
 

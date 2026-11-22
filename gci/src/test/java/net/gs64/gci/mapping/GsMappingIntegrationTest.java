@@ -152,6 +152,134 @@ class GsMappingIntegrationTest {
     }
 
     @StoneTest
+    void aSharedMappingCacheValidatesOnce() {
+        var cache = new GsMappingCache(s(), net.gs64.gci.GsGeneratedMappings.DEFAULT);
+        try (var warm = new GsObjectContext(cache)) {
+            warm.load("UserGlobals at: #GsMapTestMany", Account[].class);
+        }
+        var shared = callsOfALoad(new GsObjectContext(cache));
+        var fresh = callsOfALoad(new GsObjectContext(s(), net.gs64.gci.GsGeneratedMappings.DEFAULT));
+        assertTrue(shared < fresh, shared + " calls with the cache, " + fresh + " without");
+
+        cache.clear(); // validated again, and still loads correctly
+        try (var ctx = new GsObjectContext(cache)) {
+            assertEquals(3000, ctx.load("UserGlobals at: #GsMapTestMany", Account[].class).length);
+        }
+    }
+
+    private long callsOfALoad(GsObjectContext ctx) {
+        var before = s().callCount();
+        try (ctx) {
+            assertEquals(3000, ctx.load("UserGlobals at: #GsMapTestMany", Account[].class).length);
+        }
+        return s().callCount() - before;
+    }
+
+    @StoneTest
+    void loadStatisticsCountReportsByClass() {
+        try (var ctx = newContext()) {
+            var many = ctx.load("UserGlobals at: #GsMapTestMany", Account[].class,
+                    GsLoadOptions.DEFAULT.withCountReportsByClass(true).withRetainInParallel(false));
+            var stats = ctx.lastLoad();
+            assertEquals(3000, many.length);
+            assertEquals(stats.reports(), stats.reportsByClass().values().stream().mapToLong(Long::longValue).sum());
+            assertTrue(stats.reportsByClass().get("GsMapTestAccount") >= 3000);
+            assertTrue(stats.total().compareTo(stats.discover().plus(stats.build())) >= 0);
+            assertEquals(stats.retain(), stats.retainWait()); // not in parallel: all of it after building
+            assertEquals(0, ctx.saveChanges()); // tracked as usual
+        }
+    }
+
+    @StoneTest
+    void validationIsOneRoundTripForAllClasses() {
+        try (var ctx = newContext()) {
+            var before = s().callCount();
+            ctx.validate(Account.class); // Account, SpecialAccount, Order, Address: four classes
+            var calls = s().callCount() - before;
+            assertTrue(calls >= 1 && calls <= 4, calls + " calls"); // execute + traversal + release
+        }
+    }
+
+    @StoneTest
+    void progressIsReportedPerPhase() {
+        try (var ctx = newContext()) {
+            var seen = new java.util.ArrayList<GsLoadProgress>();
+            var many = ctx.load("UserGlobals at: #GsMapTestMany", Account[].class, GsLoadOptions.DEFAULT.withProgress(seen::add));
+            assertEquals(List.of(GsLoadProgress.Phase.DISCOVER, GsLoadProgress.Phase.BUILD, GsLoadProgress.Phase.DONE),
+                    seen.stream().map(GsLoadProgress::phase).distinct().toList());
+            var done = seen.get(seen.size() - 1);
+            assertEquals(1.0, done.buildFraction());
+            assertEquals(ctx.lastLoad().objects(), done.objects());
+            assertEquals(ctx.lastLoad().reports(), done.reports());
+            assertTrue(done.objectsTotal() >= many.length);
+        }
+    }
+
+    @StoneTest
+    void walkingAndConvertingWhileTheServerWorksLoadsTheSame() {
+        // Small buffers: several per traversal, and the root array arrives in pieces.
+        var options = GsLoadOptions.DEFAULT.withBufferSize(16 * 1024);
+        var serialStats = new GsLoadStatistics[1];
+        var overlappedStats = new GsLoadStatistics[1];
+        var serial = loadMany(options.withWalkDuringTraversal(false).withConvertInParallel(false), serialStats);
+        var overlapped = loadMany(options, overlappedStats);
+
+        assertEquals(3000, overlapped.length);
+        assertEquals(Arrays.stream(serial).map(GsMappingIntegrationTest::describe).toList(),
+                Arrays.stream(overlapped).map(GsMappingIntegrationTest::describe).toList());
+        assertEquals(serialStats[0].reports(), overlappedStats[0].reports());
+        assertEquals(serialStats[0].objects(), overlappedStats[0].objects());
+        assertEquals(serialStats[0].convert(), serialStats[0].convertWait()); // not in parallel: all of it before building
+    }
+
+    private Account[] loadMany(GsLoadOptions options, GsLoadStatistics[] stats) {
+        try (var ctx = newContext()) { // a fresh cache each: the classes are first met during the traversal
+            var many = ctx.load("UserGlobals at: #GsMapTestMany", Account[].class, options);
+            stats[0] = ctx.lastLoad();
+            return many;
+        }
+    }
+
+    private static String describe(Account a) {
+        return a.getClass().getSimpleName() + " " + a.name + " " + a.balance + " " + (a.address == null ? null : a.address.city) + " "
+                + a.orders.size() + " " + a.tags.stream().sorted().collect(Collectors.joining(",")) + " " + a.status + " " + a.opened;
+    }
+
+    @StoneTest
+    void loadAsyncLoadsLikeLoad() throws Exception {
+        try (var ctx = newContext()) {
+            var many = ctx.loadAsync("UserGlobals at: #GsMapTestMany", Account[].class, null).get();
+            assertEquals(3000, many.length);
+            assertEquals(new BigDecimal("1500.00"), many[1499].balance);
+            assertSame(many[0], ctx.loadAsync(many[0].oop, Account.class, null).get()); // same context, same instance
+            assertEquals(0, ctx.saveChangesAsync().get());
+            assertEquals(1, ctx.refreshAsync(List.of(many[1].oop), null).get().size());
+        }
+    }
+
+    @StoneTest
+    void aCancelledLoadLeavesTheContextAsItWas() throws Exception {
+        try (var ctx = newContext()) {
+            @SuppressWarnings("unchecked")
+            var future = (java.util.concurrent.CompletableFuture<Account[]>[]) new java.util.concurrent.CompletableFuture<?>[1];
+            var options = GsLoadOptions.DEFAULT.withBufferSize(16 * 1024).withProgress(p -> {
+                if (p.phase() == GsLoadProgress.Phase.DISCOVER) future[0].cancel(true); // while discovering
+            });
+            // The delay in the source: the future is known before the progress callback runs on the loading thread.
+            var started = ctx.loadAsync("(Delay forMilliseconds: 50) wait. UserGlobals at: #GsMapTestMany", Account[].class, options);
+            future[0] = started;
+            assertThrows(java.util.concurrent.CancellationException.class, started::get); // as for a cancelled future
+
+            var oop = s().execute("(UserGlobals at: #GsMapTestMany) first");
+            assertNull(ctx.entityFor(oop));
+            assertNull(ctx.lastLoad());
+            // The session is usable, and so is the context.
+            assertEquals(3000, ctx.loadAsync("UserGlobals at: #GsMapTestMany", Account[].class, null).get().length);
+            assertNotNull(ctx.entityFor(oop));
+        }
+    }
+
+    @StoneTest
     void reloadRefreshesTheSameInstance() {
         var ctx = newContext();
         var first = ctx.load("UserGlobals at: #GsMapTestOrderNoLines", Order.class);

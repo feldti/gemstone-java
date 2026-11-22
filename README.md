@@ -39,7 +39,7 @@ access, traversals, path fetches, store traversals, transactions, asynchronous c
 cancellation, and the object mapper (`GsObjectContext`: annotated Java classes, identity map,
 change tracking, batched saves that patch collections in place), signals between sessions with
 a listener, a persistent change feed with a replica that follows it, and repository
-administration (space, garbage collection, instance counts, sessions, backups). An annotation processor
+administration (space, garbage collection, instance counts, sessions, backups). Large loads overlap the client's work with the gem's (double-buffered traversals, walking the reports while the next buffer arrives, retain and value conversion in parallel), report where the time went (`lastLoad()`) and progress, and can share the validated mapping between contexts (`GsMappingCache`). `loadAsync`, `refreshAsync`, `saveChangesAsync` and `saveChangesAndCommitAsync` run on another thread with cancellation; traversals and save batches leave the GCI to other sessions while the gem works. An annotation processor
 (`gs64-gci-processor`) generates the mapping metadata at compile time instead of reflection:
 
 ```xml

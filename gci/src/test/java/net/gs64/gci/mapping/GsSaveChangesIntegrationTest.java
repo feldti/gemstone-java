@@ -106,6 +106,47 @@ class GsSaveChangesIntegrationTest {
         return key;
     }
 
+    @StoneTest
+    void emptyCollectionsAsNil() {
+        var key = newAccount();
+        var acc = "(UserGlobals at: #" + key + ")";
+        s().execute(acc + " instVarNamed: 'orderList' put: nil; instVarNamed: 'tags' put: nil. true");
+        try (var plain = newContext()) {
+            assertNull(plain.load(acc, Account.class).orders); // without the option: nil is null
+        }
+
+        try (var ctx = newContext()) {
+            ctx.setEmptyCollectionsAsNil(true);
+            var a = ctx.load(acc, Account.class);
+            assertTrue(a.orders.isEmpty());
+            assertTrue(a.tags.isEmpty());
+            assertEquals(0, ctx.saveChanges()); // empty and nil: nothing to write
+            assertTrue(eval("(" + acc + " instVarNamed: 'orderList') isNil", Boolean.class));
+
+            // Elements: a collection is created. A new object with empty collections gets nil.
+            var order = new Order();
+            order.number = 7;
+            order.account = new Account();
+            order.account.name = "New";
+            order.account.orders = new ArrayList<>();
+            a.orders.add(order);
+            assertTrue(ctx.saveChanges() > 0);
+            assertEquals(1L, eval("(" + acc + " instVarNamed: 'orderList') size", Long.class));
+            var created = "((" + acc + " instVarNamed: 'orderList') first instVarNamed: 'account')";
+            assertTrue(eval("(" + created + " instVarNamed: 'orderList') isNil & (" + created + " instVarNamed: 'tags') isNil", Boolean.class));
+            assertEquals(0, ctx.saveChanges());
+        }
+
+        try (var again = newContext()) {
+            again.setEmptyCollectionsAsNil(true);
+            var reloaded = again.load(acc, Account.class);
+            assertEquals(1, reloaded.orders.size());
+            assertEquals(7, reloaded.orders.get(0).number);
+            assertTrue(reloaded.orders.get(0).account.orders.isEmpty());
+            assertEquals(0, again.saveChanges());
+        }
+    }
+
     private <T> T eval(String source, Class<T> type) {
         return s().evaluate(source, type);
     }

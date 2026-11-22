@@ -15,6 +15,12 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -48,8 +54,8 @@ public final class GsObjectContext implements AutoCloseable {
     private static final String CLAMP_SPECS = GsObjectContext.class.getName() + ".clampSpecs";
 
     final GciSession session;
-    private final GsMappingProvider mappings;
-    private GsShapeFactory shapes;
+    /** Shapes, resolved classes and class facts; shared with other contexts of the session (see {@link GsMappingCache}). */
+    final GsMappingCache meta;
 
     /** OOP → the Java instance, or a {@link Several} when the object was loaded as more than one Java class. */
     final Map<Oop, Object> identity = new HashMap<>();
@@ -67,11 +73,6 @@ public final class GsObjectContext implements AutoCloseable {
     final Map<Object, EntityEntry> entries = new IdentityHashMap<>();
     /** OOPs this context holds in the export set (released by close / clear). */
     final Set<Oop> retained = new HashSet<>();
-    private final Map<Oop, Map<Oop, Boolean>> subclassCache = new HashMap<>();
-    private final Map<Oop, CollectionClass> collectionCache = new HashMap<>();
-    private final Map<String, Oop> kernelClasses = new HashMap<>();
-    /** Resolved type maps (class OOP and instVar indexes known): the source of the ClampSpecification. */
-    final List<GsTypeMap> resolvedMaps = new ArrayList<>();
     private Oop clampSpec = Oop.ILLEGAL; // owned by the session
     private int clampSpecMaps = -1;
     private String clampSpecSelector;
@@ -82,6 +83,31 @@ public final class GsObjectContext implements AutoCloseable {
     public long lastLoadReports() {
         return lastLoadReports;
     }
+
+    GsLoadStatistics lastLoad;
+
+    /** Where the time of the last load or refresh went (null before the first). */
+    public GsLoadStatistics lastLoad() {
+        return lastLoad;
+    }
+
+    private boolean emptyCollectionsAsNil;
+
+    /** See {@link #setEmptyCollectionsAsNil}. */
+    public boolean emptyCollectionsAsNil() {
+        return emptyCollectionsAsNil;
+    }
+
+    /**
+     * Empty collections are nil on the server: nil in a collection field loads as an empty Java
+     * collection, and an empty collection is not stored (a field that is nil on the server stays nil,
+     * a new object gets nil instead of an empty collection). Saves a report and an object per empty
+     * to-many association. Only fields, not collections inside collections, not with a converter.
+     * Collections that exist on the server stay until the data is converted.
+     */
+    public void setEmptyCollectionsAsNil(boolean value) {
+        emptyCollectionsAsNil = value;
+    }
     /**
      * Collection OOP -> the object that holds it in a field (or a {@code List} of several), as
      * loaded: lets refresh find the owner of a reported collection without scanning every
@@ -90,7 +116,6 @@ public final class GsObjectContext implements AutoCloseable {
      * are not in it; refresh scans the snapshots for those.
      */
     final Map<Oop, Object> collectionOwnerIndex = new HashMap<>();
-    private final Map<Oop, String> classNames = new HashMap<>();
     boolean ownRoot;
 
     /** A context that finds the mapping metadata by reflection. */
@@ -100,9 +125,16 @@ public final class GsObjectContext implements AutoCloseable {
 
     /** A context with the given mapping metadata (a {@link ReflectionMappingProvider} with registered classes, or generated metadata). */
     public GsObjectContext(GciSession session, GsMappingProvider mappings) {
-        this.session = Objects.requireNonNull(session, "session");
-        this.mappings = Objects.requireNonNull(mappings, "mappings");
-        this.shapes = new GsShapeFactory(mappings);
+        this(new GsMappingCache(session, mappings));
+    }
+
+    /**
+     * A context that shares its mapping metadata with other contexts of the same session, e.g. one
+     * context per unit of work: the mapping is validated once per cache, not once per context.
+     */
+    public GsObjectContext(GsMappingCache cache) {
+        this.meta = Objects.requireNonNull(cache, "cache");
+        this.session = cache.session();
     }
 
     /** The session this context loads from and saves to. */
@@ -134,10 +166,14 @@ public final class GsObjectContext implements AutoCloseable {
     public Object load(Oop root, Type type, GsLoadOptions options) {
         var opts = options == null ? GsLoadOptions.DEFAULT : options;
         if (opts.depth() < 1) throw new IllegalArgumentException("depth must be at least 1.");
+        var start = System.nanoTime();
         var shape = prepare(type);
-        var run = new LoadRun(this, opts, !ownRoot);
-        run.discover(List.of(new LoadRun.Root(root, shape, "root")));
-        var result = run.build(List.of(new LoadRun.Root(root, shape, "root")))[0];
+        var run = new LoadRun(this, opts, !ownRoot, start, System.nanoTime() - start, takeResolveTime());
+        var roots = List.of(new LoadRun.Root(root, shape, "root"));
+        run.discover(roots);
+        checkCancelled(); // the last point where the context is unchanged
+        var result = run.build(roots)[0];
+        if (lastLoad != null) lastLoad.total = System.nanoTime() - start;
         if (result == null && Types.raw(type).isPrimitive())
             throw GsMappingException.of("root: nil cannot be loaded as " + type.getTypeName() + ".");
         return result;
@@ -172,17 +208,155 @@ public final class GsObjectContext implements AutoCloseable {
 
     /** Executes Smalltalk and loads the result as any (generic) type. */
     public Object load(String source, Type type, GsLoadOptions options) {
+        var start = System.nanoTime();
         var root = session.execute(source);
         var keep = false;
+        var loaded = false;
         try {
             ownRoot = true;
             var result = load(root, type, options);
+            loaded = true;
             keep = retained.contains(root); // tracked: the context owns the result now
             return result;
         } finally {
             ownRoot = false;
             if (!keep) session.release(root);
+            if (loaded && lastLoad != null) lastLoad.total = System.nanoTime() - start;
         }
+    }
+
+    // =========================================================================================
+    // Asynchronous variants
+    // =========================================================================================
+
+    /**
+     * {@link #load(Oop, Type, GsLoadOptions)} on another thread, for callers that must not block (a
+     * UI thread). While the gem works, the GCI lock is free (other sessions of the process go on).
+     *
+     * <p>{@link CompletableFuture#cancel(boolean) cancel} requests a stop, honored until the objects
+     * are built (between traversal buffers and rounds); the future then completes with a
+     * {@link CancellationException} and the context is as it was. Once building has started, the load
+     * completes. The context is not thread-safe: do not use it until the future has completed. The
+     * Java objects are constructed on the other thread, and {@link GsLoadOptions#progress()} is called
+     * there.
+     */
+    public CompletableFuture<Object> loadAsync(Oop root, Type type, GsLoadOptions options) {
+        return runAsync(() -> load(root, type, options));
+    }
+
+    /** {@link #loadAsync(Oop, Type, GsLoadOptions)} for a class. */
+    public <T> CompletableFuture<T> loadAsync(Oop root, Class<T> type, GsLoadOptions options) {
+        return runAsync(() -> load(root, type, options));
+    }
+
+    /** {@link #load(String, Class, GsLoadOptions)} on another thread; see {@link #loadAsync(Oop, Type, GsLoadOptions)}. */
+    public <T> CompletableFuture<T> loadAsync(String source, Class<T> type, GsLoadOptions options) {
+        Objects.requireNonNull(source, "source");
+        return runAsync(() -> load(source, type, options));
+    }
+
+    /** {@link #load(String, TypeRef, GsLoadOptions)} on another thread; see {@link #loadAsync(Oop, Type, GsLoadOptions)}. */
+    public <T> CompletableFuture<T> loadAsync(String source, TypeRef<T> type, GsLoadOptions options) {
+        Objects.requireNonNull(source, "source");
+        return runAsync(() -> load(source, type, options));
+    }
+
+    /** {@link #refresh(Collection, GsLoadOptions)} on another thread; cancellation as for {@link #loadAsync(Oop, Type, GsLoadOptions)}. */
+    public CompletableFuture<List<Object>> refreshAsync(Collection<Oop> oopsToRefresh, GsLoadOptions options) {
+        Objects.requireNonNull(oopsToRefresh, "oopsToRefresh");
+        return runAsync(() -> refresh(oopsToRefresh, options));
+    }
+
+    /**
+     * {@link #saveChanges()} on another thread (comparing a large context takes a while, the batch
+     * waits for the gem with the GCI lock free). Cancellation is honored until the batch is sent.
+     */
+    public CompletableFuture<Integer> saveChangesAsync() {
+        return runAsync(this::saveChanges);
+    }
+
+    /** {@link #saveChanges(Iterable)} on another thread; cancellation as for {@link #saveChangesAsync()}. */
+    public CompletableFuture<Integer> saveChangesAsync(Iterable<?> candidates) {
+        Objects.requireNonNull(candidates, "candidates");
+        return runAsync(() -> saveChanges(candidates));
+    }
+
+    /**
+     * {@link #saveChangesAndCommit(int)} on another thread. Cancellation is honored before a batch is
+     * sent, also before a repeated one after a conflict (the changes are then unsaved, as after a
+     * failed commit).
+     */
+    public CompletableFuture<Integer> saveChangesAndCommitAsync(int maxAttempts) {
+        return runAsync(() -> saveChangesAndCommit(maxAttempts));
+    }
+
+    /** {@link #saveChangesAndCommit(Iterable, int)} on another thread; cancellation as for {@link #saveChangesAndCommitAsync(int)}. */
+    public CompletableFuture<Integer> saveChangesAndCommitAsync(Iterable<?> candidates, int maxAttempts) {
+        Objects.requireNonNull(candidates, "candidates");
+        return runAsync(() -> saveChangesAndCommit(candidates, maxAttempts));
+    }
+
+    /**
+     * Platform threads for the asynchronous variants (the GCI's native waits would pin a virtual
+     * thread's carrier); kept for a minute.
+     */
+    private static final ExecutorService ASYNC = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 60, TimeUnit.SECONDS,
+            new SynchronousQueue<>(), Thread.ofPlatform().daemon().name("gs-context-", 0).factory());
+
+    /** Platform threads for work a load does beside building (retain, conversion batch). */
+    static final ExecutorService BACKGROUND = new ThreadPoolExecutor(0, Integer.MAX_VALUE, 60, TimeUnit.SECONDS,
+            new SynchronousQueue<>(), Thread.ofPlatform().daemon().name("gs-load-", 0).factory());
+
+    /** The future of the running asynchronous operation; its cancellation is checked at the points that leave the context consistent. */
+    private volatile OperationFuture<?> running;
+
+    /** A future whose {@code cancel} only requests a stop; it completes when the operation has stopped. */
+    private static final class OperationFuture<T> extends CompletableFuture<T> {
+        volatile boolean cancelRequested;
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            if (isDone()) return false;
+            cancelRequested = true;
+            return true;
+        }
+
+        @Override
+        public <U> CompletableFuture<U> newIncompleteFuture() {
+            return new CompletableFuture<>();
+        }
+    }
+
+    private <T> CompletableFuture<T> runAsync(java.util.function.Supplier<T> work) {
+        var future = new OperationFuture<T>();
+        synchronized (this) {
+            if (running != null) throw new IllegalStateException("An asynchronous operation of this context is still running; wait for it first.");
+            running = future;
+        }
+        ASYNC.execute(() -> {
+            try {
+                var result = work.get();
+                finish();
+                future.complete(result);
+            } catch (CancellationException e) {
+                finish();
+                future.completeExceptionally(e);
+            } catch (Throwable t) {
+                finish();
+                future.completeExceptionally(t);
+            }
+        });
+        return future;
+    }
+
+    private synchronized void finish() {
+        running = null;
+    }
+
+    /** Throws a {@link CancellationException} if the running asynchronous operation was cancelled. */
+    void checkCancelled() {
+        var f = running;
+        if (f != null && f.cancelRequested) throw new CancellationException("The operation was cancelled; the context is unchanged.");
     }
 
     /** The instance of {@code type} (or a subclass) this context holds for {@code oop}, or null. */
@@ -218,13 +392,17 @@ public final class GsObjectContext implements AutoCloseable {
      */
     public List<Object> refresh(Collection<Oop> oopsToRefresh, GsLoadOptions options) {
         var opts = options == null ? GsLoadOptions.DEFAULT : options;
+        if (opts.depth() < 1) throw new IllegalArgumentException("depth must be at least 1.");
+        var start = System.nanoTime();
         var result = refreshTargets(oopsToRefresh);
         if (result.isEmpty()) return List.of();
         var roots = new ArrayList<LoadRun.Root>();
         for (var e : result) roots.add(new LoadRun.Root(oopOf(e), prepare(e.getClass()), e.getClass().getSimpleName() + " " + oopOf(e)));
-        var run = new LoadRun(this, opts, false);
+        var run = new LoadRun(this, opts, false, start, System.nanoTime() - start, takeResolveTime());
         run.discover(roots);
+        checkCancelled();
         run.build(roots);
+        if (lastLoad != null) lastLoad.total = System.nanoTime() - start;
         return result;
     }
 
@@ -358,16 +536,27 @@ public final class GsObjectContext implements AutoCloseable {
 
     GsShape prepare(Type type) {
         var errors = new ArrayList<String>();
-        var shape = shapes.shapeOf(type, errors, Types.raw(type).getSimpleName());
-        var maps = new ArrayList<>(shapes.newMaps);
-        shapes.newMaps.clear();
-        for (var map : maps) if (!map.polymorphic) resolve(map, errors);
+        var shape = meta.shapes.shapeOf(type, errors, Types.raw(type).getSimpleName());
+        var maps = new ArrayList<>(meta.shapes.newMaps);
+        meta.shapes.newMaps.clear();
+        var start = System.nanoTime();
+        resolveAll(maps.stream().filter(m -> !m.polymorphic).toList(), errors);
+        lastResolve += System.nanoTime() - start;
         if (!errors.isEmpty()) {
-            shapes = new GsShapeFactory(mappings); // not usable: start over next time (e.g. after the image was fixed)
+            meta.shapes = new GsShapeFactory(meta.mappings()); // not usable: start over next time (e.g. after the image was fixed)
             throw GsMappingException.of(errors);
         }
-        resolvedMaps.addAll(maps);
+        meta.resolvedMaps.addAll(maps);
         return shape;
+    }
+
+    /** Time prepare spent resolving classes on the server, for the next load's statistics. */
+    private long lastResolve;
+
+    private long takeResolveTime() {
+        var t = lastResolve;
+        lastResolve = 0;
+        return t;
     }
 
     /** Per session and selector: the specification for all mappings used in it. */
@@ -383,8 +572,8 @@ public final class GsObjectContext implements AutoCloseable {
      * a class or a followed instance variable.
      */
     GciTraversalOptions traversalOptions(GsLoadOptions options) {
-        var trav = GciTraversalOptions.DEFAULT.withBufferSize(options.bufferSize());
-        if (!options.clamp() || resolvedMaps.isEmpty()) return trav;
+        var trav = GciTraversalOptions.DEFAULT.withBufferSize(options.bufferSize() > 0 ? options.bufferSize() : session.preferredTraversalBufferSize());
+        if (!options.clamp() || meta.resolvedMaps.isEmpty()) return trav;
         var selector = options.clampLevelsSelector();
         if (selector == null || !IDENTIFIER.matcher(selector).matches())
             throw new IllegalArgumentException("'" + selector + "' is not a unary selector.");
@@ -392,9 +581,9 @@ public final class GsObjectContext implements AutoCloseable {
             @SuppressWarnings("unchecked")
             var specs = (Map<String, ClampState>) SessionAccess.get().attachments(session).computeIfAbsent(CLAMP_SPECS, k -> new HashMap<String, ClampState>());
             var state = specs.computeIfAbsent(selector, k -> new ClampState());
-            if (clampSpecMaps != resolvedMaps.size() || !selector.equals(clampSpecSelector) || !clampSpec.equals(state.spec)) {
+            if (clampSpecMaps != meta.resolvedMaps.size() || !selector.equals(clampSpecSelector) || !clampSpec.equals(state.spec)) {
                 var changed = state.spec.equals(Oop.ILLEGAL);
-                for (var map : resolvedMaps) {
+                for (var map : meta.resolvedMaps) {
                     if (map.polymorphic) continue;
                     var followed = state.followed.get(map.classOop);
                     if (followed == null) {
@@ -426,55 +615,100 @@ public final class GsObjectContext implements AutoCloseable {
                             """.formatted(entriesSource, selector));
                 }
                 clampSpec = state.spec;
-                clampSpecMaps = resolvedMaps.size();
+                clampSpecMaps = meta.resolvedMaps.size();
                 clampSpecSelector = selector;
             }
             return trav.withClampSpec(clampSpec);
         });
     }
 
-    /** Resolves the GemStone class and the instVar indices of a type map. */
-    private void resolve(GsTypeMap map, List<String> errors) {
-        var name = map.className;
-        var dict = map.dictionary;
-        if (!IDENTIFIER.matcher(name).matches() || (dict != null && !IDENTIFIER.matcher(dict).matches())) {
-            errors.add(map.type.getSimpleName() + ": invalid class or dictionary name '" + (dict == null ? "" : dict + ".") + name + "'.");
+    /**
+     * A block answering the superclasses of a class. Not {@code allSuperclasses}: that costs about 2
+     * ms per class on the server (3.7.6; 420 classes: 0.9 s), walking {@code superclass} nothing.
+     */
+    private static final String SUPERCLASS_CHAIN =
+            "[:cls | | c a | a := Array new. c := cls superclass. [c notNil] whileTrue: [a add: c. c := c superclass]. a]";
+
+    /**
+     * Resolves the classes of several type maps in one round trip: class, instance variable names
+     * and superclass chain of each (a large model has hundreds of mapped classes; one by one that
+     * was several round trips per class plus one per subclass check). The usual collection classes
+     * come along the first time (see {@link #primeCollectionClasses}).
+     */
+    private void resolveAll(List<GsTypeMap> maps, List<String> errors) {
+        var batch = new ArrayList<GsTypeMap>();
+        for (var map : maps) {
+            var name = map.className;
+            var dict = map.dictionary;
+            if (!IDENTIFIER.matcher(name).matches() || (dict != null && !IDENTIFIER.matcher(dict).matches()))
+                errors.add(map.type.getSimpleName() + ": invalid class or dictionary name '" + (dict == null ? "" : dict + ".") + name + "'.");
+            else batch.add(map);
+        }
+        if (batch.isEmpty()) {
+            primeCollectionClasses();
             return;
         }
-        Oop cls;
-        if (dict == null) {
-            cls = session.tryResolveSymbol(name, null);
-            if (cls == null) {
-                errors.add(map.type.getSimpleName() + ": GemStone class '" + name + "' not found in the symbol list.");
-                return;
+        var entries = new StringBuilder();
+        for (var map : batch)
+            entries.append(map.dictionary != null ? "{#" + map.className + ". #" + map.dictionary + "}. " : "{#" + map.className + ". nil}. ");
+        var prime = kernelCollectionsKnown() ? null : PRIMED_COLLECTION_NAMES;
+        var t = session.executeTraverse("""
+                | sl up |
+                sl := GsCurrentSession currentSession symbolList.
+                up := System myUserProfile symbolList.
+                { %s. { %s } collect: [:e | | cls d |
+                    (e at: 2) isNil
+                        ifTrue: [cls := sl objectNamed: (e at: 1)]
+                        ifFalse: [
+                            d := up objectNamed: (e at: 2).
+                            cls := (d isKindOf: AbstractDictionary) ifTrue: [d at: (e at: 1) otherwise: nil] ifFalse: [nil]].
+                    cls isNil
+                        ifTrue: [0]
+                        ifFalse: [
+                            cls isBehavior
+                                ifFalse: [1]
+                                ifTrue: [| s |
+                                    s := WriteStream on: String new.
+                                    cls allInstVarNames do: [:n | s nextPutAll: n] separatedBy: [s space].
+                                    {cls. s contents. %s value: cls}]]] }
+                """.formatted(prime == null ? "nil" : collectionClassesSource(prime), entries, SUPERCLASS_CHAIN), 4, null);
+        var both = t.get(t.result()).indexedValues();
+        if (prime != null) takeCollectionClasses(t, new Oop(both[0]), prime);
+        var results = t.get(new Oop(both[1])).indexedValues();
+        for (var i = 0; i < batch.size(); i++) {
+            var map = batch.get(i);
+            var r = new Oop(results[i]);
+            if (r.isSpecial()) {
+                errors.add(r.equals(Oop.fromSmallInteger(0))
+                        ? map.dictionary != null
+                        ? map.type.getSimpleName() + ": GemStone class '" + map.className + "' not found in " + map.dictionary + "."
+                        : map.type.getSimpleName() + ": GemStone class '" + map.className + "' not found in the symbol list."
+                        : map.type.getSimpleName() + ": '" + map.className + "' is not a class.");
+                continue;
             }
-            session.release(cls); // classes are referenced from their dictionary
-        } else {
-            cls = session.execute("| d | d := System myUserProfile symbolList objectNamed: #" + dict + ". "
-                    + "(d isKindOf: AbstractDictionary) ifTrue: [d at: #" + name + " otherwise: nil] ifFalse: [nil]");
-            session.release(cls);
-            if (cls.isNil()) {
-                errors.add(map.type.getSimpleName() + ": GemStone class '" + name + "' not found in " + dict + ".");
-                return;
-            }
+            var slots = t.get(r).indexedValues();
+            var cls = new Oop(slots[0]);
+            var text = t.toValue(new Oop(slots[1])) instanceof String str ? str : "";
+            var names = text.isEmpty() ? List.<String>of() : List.of(text.split(" "));
+            meta.superclasses.put(cls, oopSet(t.get(new Oop(slots[2])).indexedValues()));
+            bind(map, cls, names, errors);
         }
-        if (!session.perform(cls, "isBehavior").equals(Oop.TRUE)) {
-            errors.add(map.type.getSimpleName() + ": '" + name + "' is not a class.");
-            return;
-        }
-        var names = instVarNames(cls);
+    }
+
+    private static Set<Oop> oopSet(long[] values) {
+        var set = new HashSet<Oop>(values.length * 2);
+        for (var v : values) set.add(new Oop(v));
+        return set;
+    }
+
+    private void bind(GsTypeMap map, Oop cls, List<String> names, List<String> errors) {
         for (var p : map.properties) {
             var index = names.indexOf(p.instVar());
-            if (index < 0) errors.add(p.path + " → '" + p.instVar() + "': no such instance variable in " + name + suggest(p.instVar(), names) + ".");
+            if (index < 0) errors.add(p.path + " → '" + p.instVar() + "': no such instance variable in " + map.className + suggest(p.instVar(), names) + ".");
             else p.index = index + 1;
         }
         map.classOop = cls;
-        classNames.put(cls, name);
-    }
-
-    private List<String> instVarNames(Oop cls) {
-        var t = session.performTraverse(cls, "allInstVarNames", 2, new Oop[0], null);
-        return t.toList(t.result()).stream().map(v -> v instanceof String s ? s : "").toList();
+        meta.classNames.put(cls, map.className);
     }
 
     private static String suggest(String name, List<String> candidates) {
@@ -510,38 +744,99 @@ public final class GsObjectContext implements AutoCloseable {
     enum CollectionClass { NONE, SEQUENCE, NSC, UNORDERED, DICTIONARY }
 
     Oop kernel(String name) {
-        var cls = kernelClasses.get(name);
+        var cls = meta.kernelClasses.get(name);
         if (cls == null) {
             if (name.equals("Array")) cls = KnownClasses.ARRAY;
             else {
                 cls = session.resolveSymbol(name);
                 session.release(cls); // kernel classes are persistent
             }
-            kernelClasses.put(name, cls);
+            meta.kernelClasses.put(name, cls);
         }
         return cls;
     }
 
     boolean isSubclass(Oop cls, Oop superclass) {
         if (cls.equals(superclass)) return true;
-        var bySuper = subclassCache.computeIfAbsent(cls, k -> new HashMap<>());
-        var result = bySuper.get(superclass);
-        if (result == null) {
-            result = session.perform(cls, "isSubclassOf:", superclass).equals(Oop.TRUE);
-            bySuper.put(superclass, result);
+        var chain = meta.superclasses.get(cls);
+        if (chain == null) {
+            // One round trip per class, then every subclass question about it is answered locally.
+            var t = session.executeTraverse(SUPERCLASS_CHAIN + " value: (Object _objectForOop: " + Long.toUnsignedString(cls.value()) + ")", 1, null);
+            chain = oopSet(t.get(t.result()).indexedValues());
+            meta.superclasses.put(cls, chain);
         }
-        return result;
+        return chain.contains(superclass);
+    }
+
+    /** Whether the superclasses of {@code cls} are known (subclass questions need no round trip). */
+    boolean classKnown(Oop cls) {
+        return meta.superclasses.containsKey(cls);
+    }
+
+    /** {@link #classify} without a round trip, or null if that would need the server. */
+    CollectionClass tryClassifyLocally(Oop cls) {
+        var known = meta.collections.get(cls);
+        if (known != null) return known;
+        if (!classKnown(cls) || !kernelCollectionsKnown()) return null;
+        return classify(cls);
+    }
+
+    private static final List<String> KERNEL_COLLECTION_NAMES = List.of("AbstractDictionary", "Array", "OrderedCollection", "IdentityBag", "Collection");
+
+    private static final List<String> PRIMED_COLLECTION_NAMES;
+
+    static {
+        var names = new ArrayList<>(KERNEL_COLLECTION_NAMES);
+        names.addAll(List.of("SortedCollection", "Set", "IdentitySet", "Bag", "Dictionary", "KeyValueDictionary", "IdentityKeyValueDictionary",
+                "SymbolDictionary", "StringKeyValueDictionary", "RcIdentityBag", "RcIdentitySet", "RcQueue", "RcKeyValueDictionary",
+                "RcLowMaintenanceIdentityBag"));
+        PRIMED_COLLECTION_NAMES = List.copyOf(names);
+    }
+
+    private boolean kernelCollectionsKnown() {
+        return meta.kernelClasses.keySet().containsAll(KERNEL_COLLECTION_NAMES);
+    }
+
+    /**
+     * The classes collection kinds are told by, and the usual collection classes with their
+     * superclasses, in one round trip: a walk during a traversal (no GCI calls) can then classify
+     * the collections it meets. Classes missing in an older version are skipped.
+     */
+    private void primeCollectionClasses() {
+        if (kernelCollectionsKnown()) return;
+        var t = session.executeTraverse(collectionClassesSource(PRIMED_COLLECTION_NAMES), 3, null);
+        takeCollectionClasses(t, t.result(), PRIMED_COLLECTION_NAMES);
+    }
+
+    /** Smalltalk answering {@code {class. superclasses}} (or nil) for each name. */
+    private static String collectionClassesSource(List<String> names) {
+        return "(#(" + names.stream().map(n -> "#" + n).collect(Collectors.joining(" ")) + ") collect: [:n | | c | c := Globals at: n otherwise: nil. "
+                + "c isBehavior ifTrue: [{c. " + SUPERCLASS_CHAIN + " value: c}] ifFalse: [nil]])";
+    }
+
+    private void takeCollectionClasses(net.gs64.gci.GciTraversal t, Oop array, List<String> names) {
+        var results = t.get(array).indexedValues();
+        for (var i = 0; i < names.size(); i++) {
+            var r = new Oop(results[i]);
+            if (r.isNil()) continue;
+            var pair = t.get(r).indexedValues();
+            var cls = new Oop(pair[0]);
+            meta.superclasses.put(cls, oopSet(t.get(new Oop(pair[1])).indexedValues()));
+            meta.classNames.put(cls, names.get(i));
+            if (KERNEL_COLLECTION_NAMES.contains(names.get(i))) meta.kernelClasses.put(names.get(i), cls);
+        }
+        for (var name : KERNEL_COLLECTION_NAMES) kernel(name); // missing ones (not expected) the usual way
     }
 
     CollectionClass classify(Oop cls) {
-        var kind = collectionCache.get(cls);
+        var kind = meta.collections.get(cls);
         if (kind == null) {
             kind = isSubclass(cls, kernel("AbstractDictionary")) ? CollectionClass.DICTIONARY
                     : isSubclass(cls, kernel("Array")) || isSubclass(cls, kernel("OrderedCollection")) ? CollectionClass.SEQUENCE
                     : isSubclass(cls, kernel("IdentityBag")) ? CollectionClass.NSC
                     : isSubclass(cls, kernel("Collection")) ? CollectionClass.UNORDERED
                     : CollectionClass.NONE;
-            collectionCache.put(cls, kind);
+            meta.collections.put(cls, kind);
         }
         return kind;
     }
@@ -559,10 +854,10 @@ public final class GsObjectContext implements AutoCloseable {
     }
 
     String className(Oop cls) {
-        var name = classNames.get(cls);
+        var name = meta.classNames.get(cls);
         if (name == null) {
             name = session.send(cls, "name") instanceof String s ? s : cls.toString();
-            classNames.put(cls, name);
+            meta.classNames.put(cls, name);
         }
         return name;
     }
@@ -799,13 +1094,24 @@ public final class GsObjectContext implements AutoCloseable {
     }
 
     /** Adds OOPs to the export set once, so that tracked objects survive until saved. */
-    void retainAll(Collection<Oop> candidates) {
+    List<Oop> retainAll(Collection<Oop> candidates) {
         var fresh = new LinkedHashMap<Oop, Boolean>();
         for (var o : candidates) if (!o.isSpecial() && !o.equals(Oop.ILLEGAL) && !retained.contains(o)) fresh.put(o, true);
-        if (fresh.isEmpty()) return;
+        if (fresh.isEmpty()) return List.of();
         var array = fresh.keySet().toArray(Oop[]::new);
         session.retain(array);
         retained.addAll(fresh.keySet());
+        return List.of(array);
+    }
+
+    /** Gives back OOPs a failed load retained (see {@link #retainAll}). */
+    void releaseRetained(List<Oop> fresh) {
+        if (fresh.isEmpty()) return;
+        fresh.forEach(retained::remove);
+        if (session.isLoggedIn()) {
+            var all = fresh.toArray(Oop[]::new);
+            for (var i = 0; i < all.length; i += 10_000) session.release(Arrays.copyOfRange(all, i, Math.min(all.length, i + 10_000)));
+        }
     }
 
     // ---- Unsaved changes -------------------------------------------------------------------

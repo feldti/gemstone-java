@@ -9,6 +9,9 @@ import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -27,6 +30,7 @@ import net.gs64.gci.GciTraversal;
 import net.gs64.gci.GciTraversalOptions;
 import net.gs64.gci.KnownClasses;
 import net.gs64.gci.Oop;
+import net.gs64.gci.internal.SessionAccess;
 import net.gs64.gci.mapping.GsObjectContext.CollectionClass;
 
 /** One load: phase 1 fetches everything the mapping needs, phase 2 builds the Java objects. */
@@ -54,6 +58,7 @@ final class LoadRun {
     private final boolean callerOwnsRoot;
     private final GciSession session;
     private final GciTraversalOptions travOptions;
+    private final SessionAccess access = SessionAccess.get();
     private Oop root = Oop.ILLEGAL;
     private final List<Oop> toRetain = new ArrayList<>();
     private final Map<Oop, GciObjectReport> reports = new HashMap<>();
@@ -66,105 +71,244 @@ final class LoadRun {
     private final Map<Oop, Map<GsTypeMap, GsTypeMap>> actualMaps = new HashMap<>();
     private final ArrayDeque<Job> fill = new ArrayDeque<>();
     private final List<Reached> reached = new ArrayList<>();
+    /** Collections the load reaches (tracked loads only): retained with the objects. */
+    private final List<Oop> collectionsReached = new ArrayList<>();
     /** Instances filled in this run (an object reached as two Java types is two instances). */
     private final Set<Object> filled = Collections.newSetFromMap(new IdentityHashMap<>());
+    private final GsLoadStatistics stats = new GsLoadStatistics();
+    /** Reports per class, with {@link GsLoadOptions#countReportsByClass()}. */
+    private final Map<Oop, Long> byClass;
+    private final long loadStart;
+    private long reportsSoFar;
+    private long lastProgress;
 
-    LoadRun(GsObjectContext ctx, GsLoadOptions options, boolean callerOwnsRoot) {
+    LoadRun(GsObjectContext ctx, GsLoadOptions options, boolean callerOwnsRoot, long loadStart, long prepareTime, long resolveTime) {
         this.ctx = ctx;
         this.options = options;
         this.callerOwnsRoot = callerOwnsRoot;
         this.session = ctx.session;
+        this.loadStart = loadStart;
+        this.byClass = options.countReportsByClass() ? new HashMap<>() : null;
+        stats.prepare = prepareTime;
+        stats.prepareResolve = resolveTime;
         ctx.lastLoadReports = 0;
         this.travOptions = ctx.traversalOptions(options);
+    }
+
+    /** Reports progress at a phase start ({@code force}) and otherwise at most every 200 ms. */
+    private void progress(GsLoadProgress.Phase phase, boolean force) {
+        if (options.progress() == null) return;
+        var now = System.nanoTime();
+        if (!force && now - lastProgress < 200_000_000L) return;
+        lastProgress = now;
+        options.progress().accept(new GsLoadProgress(phase, reportsSoFar, filled.size(), reached.size(),
+                java.time.Duration.ofNanos(now - loadStart)));
+    }
+
+    private void count(GciObjectReport r) {
+        byClass.merge(r.objectClass(), 1L, Long::sum);
     }
 
     // ---- Phase 1: fetch everything the mapping needs ----
 
     void discover(List<Root> roots) {
-        var missing = new LinkedHashSet<Oop>();
-        var toFlatten = new LinkedHashSet<Oop>();
-        var fetch = roots.stream().filter(r -> needsReport(r.oop(), r.shape())).map(Root::oop).distinct().toArray(Oop[]::new);
-        if (fetch.length > 0) fetch(fetch);
-        // Visited per shape; depth first (a breadth-first queue holds the whole frontier of a large graph).
-        var visited = new HashMap<GsShape, Set<Oop>>();
-        var stack = new ArrayDeque<Node>();
-        var blocked = new ArrayList<Node>();
-        for (var r : roots) stack.push(new Node(r.oop(), r.shape(), r.where()));
+        var start = System.nanoTime();
+        var waited = access.traversalWaitNanos(session);
+        progress(GsLoadProgress.Phase.DISCOVER, true);
+        try {
+            discoverAll(roots);
+        } finally {
+            stats.discover = System.nanoTime() - start;
+            stats.traverseWait = access.traversalWaitNanos(session) - waited;
+        }
+    }
+
+    // The walk over the reports. Depth first: a breadth-first queue holds the whole frontier of a
+    // large graph at once (millions of entries), a stack only the open paths. The order does not matter.
+    private final ArrayDeque<Node> stack = new ArrayDeque<>();
+    /** Visited per shape. */
+    private final Map<GsShape, Set<Oop>> visited = new HashMap<>();
+    /** Nodes waiting for the report of their object, by OOP: the next traversal fetches these. */
+    private final Map<Oop, List<Node>> waiting = new LinkedHashMap<>();
+    /** Nodes the walk during a traversal could not handle without the server (unknown class, partial report …). */
+    private final List<Node> deferred = new ArrayList<>();
+    /** Hashed collections to flatten on the server, and the nodes waiting for that. */
+    private final Set<Oop> toFlatten = new LinkedHashSet<>();
+    private final List<Node> blocked = new ArrayList<>();
+    private int round;
+
+    private void discoverAll(List<Root> roots) {
+        // Reversed: popped (and so fetched) in the order given.
+        for (var i = roots.size() - 1; i >= 0; i--) stack.push(new Node(roots.get(i).oop(), roots.get(i).shape(), roots.get(i).where()));
         if (options.stopAtLoadedObjects()) for (var r : roots) rootOops.add(r.oop());
         while (true) {
-            while (!stack.isEmpty()) {
-                var node = stack.pop();
-                var oop = node.oop();
-                var s = node.shape();
-                if (isLoadedElsewhere(oop, s)) continue;
-                if ((s.kind == ShapeKind.SCALAR || s.kind == ShapeKind.OBJECT) && oop.isSpecial() && !GciTraversal.canDecode(oop, reports))
-                    toConvert.add(oop); // SmallScaledDecimal, SmallDate, SmallDateAndTime …
-                if (!needsReport(oop, s)) continue;
-                var seen = visited.computeIfAbsent(s, k -> new HashSet<>());
-                if (!seen.add(oop)) continue;
-                var report = reports.get(oop);
-                if (report == null) {
-                    missing.add(oop);
-                    seen.remove(oop);
-                    blocked.add(node);
-                    continue;
+            ctx.checkCancelled();
+            walk(false);
+            if (waiting.isEmpty() && toFlatten.isEmpty()) return;
+            if (!waiting.isEmpty()) {
+                var fetch = waiting.keySet().toArray(Oop[]::new);
+                if (options.stopAtLoadedObjects() && round > 0) {
+                    // A refresh in a large context: a collection fetched now (one an earlier root
+                    // reached too deep to expand, see fetch) mostly holds known objects. With the full
+                    // depth the traversal would report all of them; new ones come in the next round.
+                    var collections = Arrays.stream(fetch).filter(o -> waiting.get(o).stream().allMatch(n -> n.shape().isCollection())).toArray(Oop[]::new);
+                    var colls = Set.of(collections);
+                    var others = collections.length == 0 ? fetch : Arrays.stream(fetch).filter(o -> !colls.contains(o)).toArray(Oop[]::new);
+                    if (collections.length > 0) fetch(collections, 1);
+                    if (others.length > 0) fetch(others, options.depth());
+                } else {
+                    fetch(fetch, options.depth());
                 }
-                if (report.noReadAuthorization()) throw GsMappingException.of(node.where() + ": no read authorization for " + oop + ".");
-                switch (s.kind) {
-                    case MAPPED -> {
-                        var map = actualMap(oop, report, s.map, node.where());
-                        reached.add(new Reached(oop, map.type));
-                        for (var p : map.properties) stack.push(new Node(namedValue(report, p, node.where()), p.shape, p.path));
-                    }
-                    case SCALAR, OBJECT -> {
-                        if (!GciTraversal.canDecode(oop, reports)) toConvert.add(oop);
-                    }
-                    case LIST, ARRAY, SET, DICTIONARY -> {
-                        var elements = elements(oop, report, s, node.where(), null);
-                        if (elements == null) {
-                            toFlatten.add(oop);
-                            seen.remove(oop);
-                            blocked.add(node);
-                            continue;
-                        }
-                        if (s.kind == ShapeKind.DICTIONARY) {
-                            var keyWhere = "key of " + node.where();
-                            var valueWhere = "value of " + node.where();
-                            for (var i = 0; i + 1 < elements.length; i += 2) {
-                                stack.push(new Node(new Oop(elements[i]), s.key, keyWhere));
-                                stack.push(new Node(new Oop(elements[i + 1]), s.value, valueWhere));
-                            }
-                        } else {
-                            var elementWhere = "element of " + node.where();
-                            for (var e : elements) stack.push(new Node(new Oop(e), s.element, elementWhere));
-                        }
-                    }
-                    default -> {
-                    }
-                }
-            }
-            if (missing.isEmpty() && toFlatten.isEmpty()) return;
-            if (!missing.isEmpty()) {
-                fetch(missing.toArray(Oop[]::new));
-                for (var o : missing)
+                round++;
+                for (var o : fetch)
                     if (!reports.containsKey(o)) throw GsMappingException.of("The server did not report " + o + ".");
+                // What the walk during the traversal left for afterwards (it needed the server).
+                for (var d : deferred) stack.push(d);
+                deferred.clear();
             }
-            if (!toFlatten.isEmpty()) flatten(toFlatten.toArray(Oop[]::new));
-            missing.clear();
-            toFlatten.clear();
-            for (var b : blocked) stack.push(b);
-            blocked.clear();
+            if (!toFlatten.isEmpty()) {
+                flatten(toFlatten.toArray(Oop[]::new));
+                toFlatten.clear();
+                for (var b : blocked) stack.push(b);
+                blocked.clear();
+            }
         }
+    }
+
+    /** A report arrived: the nodes waiting for it can go on. */
+    private void arrived(Oop oop) {
+        if (waiting.isEmpty()) return;
+        var nodes = waiting.remove(oop);
+        if (nodes != null) for (var n : nodes) stack.push(n);
+    }
+
+    /**
+     * Walks what can be walked. {@code live}: called while a traversal is running (between two
+     * buffers, the gem fills the next one): no GCI call is allowed then, so anything that would need
+     * the server (a class not seen yet, a report still incomplete) is deferred until afterwards.
+     * Errors with a message built locally may be thrown; the traversal is then drained.
+     */
+    private void walk(boolean live) {
+        while (!stack.isEmpty()) {
+            var node = stack.pop();
+            var oop = node.oop();
+            var s = node.shape();
+            if (isLoadedElsewhere(oop, s)) continue;
+            if ((s.kind == ShapeKind.SCALAR || s.kind == ShapeKind.OBJECT) && oop.isSpecial() && !GciTraversal.canDecode(oop, reports))
+                toConvert.add(oop); // SmallScaledDecimal, SmallDate, SmallDateAndTime …
+            if (!needsReport(oop, s)) continue;
+            var seen = visited.computeIfAbsent(s, k -> new HashSet<>());
+            if (!seen.add(oop)) continue;
+            var report = reports.get(oop);
+            if (report == null) {
+                seen.remove(oop);
+                waiting.computeIfAbsent(oop, k -> new ArrayList<>(1)).add(node);
+                continue;
+            }
+            if (live && !locallyWalkable(oop, report, s)) {
+                seen.remove(oop);
+                deferred.add(node);
+                continue;
+            }
+            if (report.noReadAuthorization()) throw GsMappingException.of(node.where() + ": no read authorization for " + oop + ".");
+            switch (s.kind) {
+                case MAPPED -> {
+                    var map = actualMap(oop, report, s.map, node.where());
+                    reached.add(new Reached(oop, map.type));
+                    for (var p : map.properties) stack.push(new Node(namedValue(report, p, node.where()), p.shape, p.path));
+                }
+                case SCALAR, OBJECT -> {
+                    if (!GciTraversal.canDecode(oop, reports)) toConvert.add(oop);
+                }
+                case LIST, ARRAY, SET, DICTIONARY -> {
+                    var elements = elements(oop, report, s, node.where(), null);
+                    if (elements == null) {
+                        toFlatten.add(oop);
+                        seen.remove(oop);
+                        blocked.add(node);
+                        continue;
+                    }
+                    if (options.trackChanges()) collectionsReached.add(oop);
+                    if (elements.length == 0) stats.emptyCollections++;
+                    if (s.kind == ShapeKind.DICTIONARY) {
+                        var keyWhere = "key of " + node.where();
+                        var valueWhere = "value of " + node.where();
+                        for (var i = 0; i + 1 < elements.length; i += 2) {
+                            stack.push(new Node(new Oop(elements[i]), s.key, keyWhere));
+                            stack.push(new Node(new Oop(elements[i + 1]), s.value, valueWhere));
+                        }
+                    } else {
+                        var elementWhere = "element of " + node.where();
+                        for (var e : elements) stack.push(new Node(new Oop(e), s.element, elementWhere));
+                    }
+                }
+                default -> {
+                }
+            }
+        }
+    }
+
+    /**
+     * Whether a node can be walked during a traversal: everything it needs is known on the client (the
+     * class of a mapped object or collection was seen before, the report is complete), and no error
+     * message would have to ask the server for a class name.
+     */
+    private boolean locallyWalkable(Oop oop, GciObjectReport report, GsShape s) {
+        if (report.isPartial() || report.noReadAuthorization()) return false;
+        return switch (s.kind) {
+            case MAPPED -> {
+                var byExpected = actualMaps.get(oop);
+                if (byExpected != null && byExpected.containsKey(s.map)) yield true;
+                if (!report.objectClass().equals(s.map.classOop) && !ctx.classKnown(report.objectClass())) yield false;
+                var map = ctx.selectMap(s.map, report.objectClass()); // local: the superclasses are known
+                yield map != null && map.create != null;
+            }
+            case LIST, ARRAY, SET, DICTIONARY -> {
+                var kind = ctx.tryClassifyLocally(report.objectClass());
+                yield kind != null && kind != CollectionClass.NONE && (s.kind != ShapeKind.DICTIONARY || kind == CollectionClass.DICTIONARY);
+            }
+            default -> true;
+        };
     }
 
     private static boolean needsReport(Oop oop, GsShape shape) {
         return !oop.isSpecial() && !oop.equals(Oop.ILLEGAL) && shape.kind != ShapeKind.OOP;
     }
 
-    private void fetch(Oop[] roots) {
-        var t = session.traverse(roots, options.depth(), travOptions);
+    /**
+     * One traversal round. Reports go into the table buffer by buffer while the gem fills the next
+     * one; an object larger than a buffer arrives in pieces and goes in merged at the end. Note: the
+     * gem reports every object once, at the level it first reaches it; a root that an earlier root
+     * reaches deeper down is not expanded again as a root. What it leaves out comes in a later round.
+     */
+    private void fetch(Oop[] roots, int depth) {
+        var start = System.nanoTime();
+        var continued = new ArrayList<Oop>();
+        var t = access.traverse(session, roots, depth, travOptions, (list, first) -> {
+            for (var i = first; i < list.size(); i++) {
+                var r = list.get(i);
+                if (r.firstOffset() != 1) continued.add(r.oop());
+                else {
+                    reportsSoFar++;
+                    // A later round reports again what an earlier one already delivered: counted, the first report stays.
+                    if (reports.putIfAbsent(r.oop(), r) == null) arrived(r.oop());
+                    else stats.duplicateReports++;
+                    if (byClass != null) count(r);
+                }
+            }
+            // Cancelled: the traversal lets the running buffer finish and drops it.
+            ctx.checkCancelled();
+            // While the gem fills the next buffer: go on with what these reports make possible.
+            if (options.walkDuringTraversal()) walk(true);
+            progress(GsLoadProgress.Phase.DISCOVER, false);
+        });
+        for (var oop : continued) {
+            reports.put(oop, t.get(oop));
+            arrived(oop);
+        }
+        progress(GsLoadProgress.Phase.DISCOVER, false);
+        stats.traverse += System.nanoTime() - start;
         ctx.lastLoadReports += t.reports().size();
-        for (var r : t.reports()) reports.put(r.oop(), r);
     }
 
     /** Server-side asArray / key-value pairs for hashed collections, all in one round trip. */
@@ -174,8 +318,18 @@ final class LoadRun {
         try {
             session.storeVaryingOops(array, 1, collections);
             block = session.execute(FLATTEN_BLOCK);
-            var t = session.performTraverse(block, "value:", options.depth() + 2, new Oop[] {array}, travOptions);
-            for (var r : t.reports()) reports.putIfAbsent(r.oop(), r);
+            var start = System.nanoTime();
+            // Depth capped: the flattened contents plus a little below them. With a large depth the
+            // whole subtree would come again (reported twice: once here, once from the first round).
+            var t = session.performTraverse(block, "value:", Math.min(options.depth(), 4) + 2, new Oop[] {array}, travOptions);
+            stats.traverse += System.nanoTime() - start;
+            ctx.lastLoadReports += t.reports().size();
+            reportsSoFar += t.reports().size();
+            for (var r : t.reports()) {
+                if (reports.putIfAbsent(r.oop(), r) == null) arrived(r.oop());
+                else stats.duplicateReports++;
+                if (byClass != null) count(r);
+            }
             var flat = t.get(t.result()).indexedValues();
             for (var i = 0; i < collections.length; i++) flattened.put(collections[i], t.get(new Oop(flat[i])).indexedValues());
         } finally {
@@ -240,27 +394,173 @@ final class LoadRun {
 
     // ---- Phase 2: build the Java objects ----
 
+    /** What a tracked load keeps in the export set, known after discover: every mapped object and collection reached. */
+    private List<Oop> retainCandidates() {
+        var all = new ArrayList<Oop>(reached.size() + collectionsReached.size());
+        for (var r : reached) if (!(callerOwnsRoot && r.oop().equals(root))) all.add(r.oop());
+        for (var o : collectionsReached) if (!(callerOwnsRoot && o.equals(root))) all.add(o);
+        return all;
+    }
+
     Object[] build(List<Root> roots) {
         // Before anything changes: refreshing an instance must not silently drop unsaved changes.
         if (!options.discardLocalChanges()) ctx.throwIfUnsavedChanges(reached);
-        if (!toConvert.isEmpty()) {
-            var pending = new ArrayList<>(toConvert);
-            var values = session.toValues(pending);
-            for (var i = 0; i < pending.size(); i++) converted.put(pending.get(i), values[i]);
-        }
+        var start = System.nanoTime();
         root = roots.size() == 1 ? roots.get(0).oop() : Oop.ILLEGAL;
-        var results = new Object[roots.size()];
-        for (var i = 0; i < roots.size(); i++) results[i] = value(roots.get(i).oop(), roots.get(i).shape(), roots.get(i).where(), null);
-        while (!fill.isEmpty()) {
-            var job = fill.poll();
-            fill(job.instance(), job.oop(), job.map());
+        // Values only the server can convert: one batch, on another thread while the objects are
+        // built (objects that need one of them are filled when it is there). Not if the caller holds
+        // the GCI lock: waiting for the other thread would deadlock.
+        CompletableFuture<Object[]> converting = null;
+        if (!toConvert.isEmpty()) {
+            var pending = pendingConversion = new ArrayList<>(toConvert);
+            if (options.convertInParallel() && !access.holdsLock()) {
+                converting = CompletableFuture.supplyAsync(() -> {
+                    var values = session.toValues(pending);
+                    stats.convert = System.nanoTime() - start;
+                    return values;
+                }, GsObjectContext.BACKGROUND);
+            } else {
+                var values = session.toValues(pending);
+                for (var i = 0; i < pending.size(); i++) converted.put(pending.get(i), values[i]);
+                stats.convert = stats.convertWait = System.nanoTime() - start;
+            }
         }
-        if (options.trackChanges()) {
+        var buildStart = System.nanoTime();
+        // Tracked: GciSaveObjs for everything reached runs on another thread while the objects are
+        // built (no GCI call in between; one that happens anyway waits for the lock).
+        CompletableFuture<List<Oop>> retaining = null;
+        if (options.trackChanges() && options.retainInParallel() && !access.holdsLock()) {
+            var candidates = retainCandidates();
+            var retainStart = System.nanoTime();
+            retaining = CompletableFuture.supplyAsync(() -> {
+                var fresh = ctx.retainAll(candidates);
+                stats.retain = System.nanoTime() - retainStart;
+                return fresh;
+            }, GsObjectContext.BACKGROUND);
+        }
+        var results = new Object[roots.size()];
+        progress(GsLoadProgress.Phase.BUILD, true);
+        try {
+            for (var i = 0; i < roots.size(); i++) {
+                if (converting != null && roots.get(i).shape().kind != ShapeKind.MAPPED) converting = finishConverting(converting);
+                results[i] = value(roots.get(i).oop(), roots.get(i).shape(), roots.get(i).where(), null);
+            }
+            var sinceCheck = 0;
+            var later = new ArrayList<Job>();
+            while (true) {
+                while (!fill.isEmpty()) {
+                    var job = fill.poll();
+                    if (converting != null && needsConverted(job.oop(), job.map())) {
+                        later.add(job);
+                        continue;
+                    }
+                    fill(job.instance(), job.oop(), job.map());
+                    if (++sinceCheck == 1024) {
+                        sinceCheck = 0;
+                        progress(GsLoadProgress.Phase.BUILD, false);
+                    }
+                }
+                if (converting == null) break;
+                converting = finishConverting(converting);
+                fill.addAll(later);
+                later.clear();
+            }
+        } catch (RuntimeException | Error e) {
+            if (converting != null) {
+                try {
+                    converting.join();
+                } catch (RuntimeException ignored) { // the build error is what matters
+                }
+            }
+            if (retaining != null) {
+                try { // nothing was loaded: give back what was retained for it
+                    ctx.releaseRetained(retaining.join());
+                } catch (RuntimeException ignored) { // the build error is what matters
+                }
+            }
+            throw e;
+        }
+        stats.build = System.nanoTime() - buildStart - stats.convertWait;
+        if (retaining != null) {
+            var waitStart = System.nanoTime();
+            join(retaining);
+            stats.retainWait = System.nanoTime() - waitStart;
+        } else if (options.trackChanges()) {
+            var retainStart = System.nanoTime();
             // Root passed in by the caller: the caller keeps it alive (and may release it).
             var keep = toRetain.stream().filter(o -> !(callerOwnsRoot && o.equals(root))).toList();
             ctx.retainAll(keep);
+            stats.retain = stats.retainWait = System.nanoTime() - retainStart;
         }
+        stats.objects = filled.size();
+        stats.reports = ctx.lastLoadReports;
+        progress(GsLoadProgress.Phase.DONE, true);
+        if (byClass != null) {
+            var byName = new HashMap<String, Long>();
+            byClass.forEach((cls, n) -> byName.merge(ctx.className(cls), n, Long::sum));
+            stats.reportsByClass = byName;
+        }
+        ctx.lastLoad = stats;
         return results;
+    }
+
+    private List<Oop> pendingConversion = List.of();
+
+    /** Waits for the conversion batch (counted as convert wait) and takes its values, here on the building thread. */
+    private CompletableFuture<Object[]> finishConverting(CompletableFuture<Object[]> converting) {
+        var waitStart = System.nanoTime();
+        var values = join(converting);
+        stats.convertWait += System.nanoTime() - waitStart;
+        for (var i = 0; i < pendingConversion.size(); i++) converted.put(pendingConversion.get(i), values[i]);
+        return null;
+    }
+
+    private static <T> T join(CompletableFuture<T> future) {
+        try {
+            return future.join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof RuntimeException r) throw r;
+            if (e.getCause() instanceof Error err) throw err;
+            throw e;
+        }
+    }
+
+    /**
+     * Whether filling this object needs a value of the conversion batch: a scalar (or converted)
+     * field, or an element of a collection of scalars. Collections of collections count as needing
+     * one (not looked into).
+     */
+    private boolean needsConverted(Oop oop, GsTypeMap map) {
+        var report = reports.get(oop);
+        for (var p : map.properties) {
+            if (p.index > report.namedSize()) return true; // fill reports the error
+            var iv = new Oop(report.namedValue(p.index));
+            if (p.converter() != null || p.shape.kind == ShapeKind.SCALAR || p.shape.kind == ShapeKind.OBJECT) {
+                if (toConvert.contains(iv)) return true;
+                continue;
+            }
+            if (!p.shape.isCollection() || iv.isSpecial()) continue;
+            var dict = p.shape.kind == ShapeKind.DICTIONARY;
+            if (dict ? needsLookAt(p.shape.key) || needsLookAt(p.shape.value) : needsLookAt(p.shape.element)) {
+                var elements = collectionElements(iv);
+                if (elements == null) return true;
+                for (var e : elements) if (toConvert.contains(new Oop(e))) return true;
+            }
+            if (dict ? p.shape.key.isCollection() || p.shape.value.isCollection() : p.shape.element.isCollection()) return true;
+        }
+        return false;
+    }
+
+    private static boolean needsLookAt(GsShape element) {
+        return element.kind == ShapeKind.SCALAR || element.kind == ShapeKind.OBJECT;
+    }
+
+    /** The element OOPs discover saw for a collection (key/value pairs for dictionaries), or null. */
+    private long[] collectionElements(Oop oop) {
+        var flat = flattened.get(oop);
+        if (flat != null) return flat;
+        var r = reports.get(oop);
+        return r != null && !r.isPartial() ? r.indexedValues() : null;
     }
 
     private void fill(Object instance, Oop oop, GsTypeMap map) {
@@ -284,6 +584,8 @@ final class LoadRun {
                         p.shape.kind != ShapeKind.DICTIONARY && ctx.classify(reports.get(ivOop).objectClass()) == CollectionClass.DICTIONARY);
                 toRetain.add(ivOop);
                 ctx.rememberCollectionOwner(ivOop, instance);
+            } else if (ivOop.isNil() && ctx.emptyCollectionsAsNil() && p.converter() == null && p.shape.isCollection()) {
+                value = p.shape.newCollection.apply(0); // nil stands for an empty collection
             } else {
                 value = value(ivOop, p.shape, p.path, p);
                 if (entry == null && p.shape.isCollection() && !ivOop.isSpecial()) ctx.rememberCollectionOwner(ivOop, instance);

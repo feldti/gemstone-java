@@ -731,6 +731,13 @@ public final class GciNative {
     private static final MethodHandle GciClampedTrav = fn("GciClampedTrav", f(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS));
     private static final MethodHandle GciMoreTraversal = fn("GciMoreTraversal", f(JAVA_INT, ADDRESS));
     private static final MethodHandle GciPerformTrav = fn("GciPerformTrav", f(JAVA_INT, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
+    // Nonblocking variants: the result (BoolType, OOP) comes from GciNbEndPoll.
+    private static final MethodHandle GciNbTraverseObjs = fn("GciNbTraverseObjs", v(ADDRESS, JAVA_INT, ADDRESS, JAVA_INT));
+    private static final MethodHandle GciNbClampedTrav = fn("GciNbClampedTrav", v(ADDRESS, JAVA_INT, ADDRESS));
+    private static final MethodHandle GciNbMoreTraversal = fn("GciNbMoreTraversal", v(ADDRESS));
+    private static final MethodHandle GciNbPerformTrav = fn("GciNbPerformTrav", v(JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT, ADDRESS));
+    private static final MethodHandle GciNbStoreTrav = fn("GciNbStoreTrav", v(ADDRESS, JAVA_INT));
+    private static final MethodHandle GciNbExecuteStrFromContext = fn("GciNbExecuteStrFromContext", v(ADDRESS, JAVA_LONG, JAVA_LONG));
 
     /**
      * void GciGetFreeOops(int count, OopType *resultOops); — at most 100,000 per call, the rest of
@@ -785,6 +792,60 @@ public final class GciNative {
     public static boolean GciPerformTrav(long receiver, String selector, MemorySegment args, int numArgs, MemorySegment travArgs) {
         try (var a = Arena.ofConfined()) {
             return (int) GciPerformTrav.invokeExact(receiver, utf8(a, selector), args, numArgs, travArgs) != 0;
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** void GciNbTraverseObjs(const OopType theOops[], int numOops, GciTravBufType *travBuff, int level); — BoolType via GciNbEndPoll. */
+    public static void GciNbTraverseObjs(MemorySegment oops, int count, MemorySegment buffer, int level) {
+        try {
+            GciNbTraverseObjs.invokeExact(oops, count, buffer, level);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** void GciNbClampedTrav(const OopType *theOops, int numOops, GciClampedTravArgsSType *args); — BoolType via GciNbEndPoll. */
+    public static void GciNbClampedTrav(MemorySegment oops, int count, MemorySegment args) {
+        try {
+            GciNbClampedTrav.invokeExact(oops, count, args);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** void GciNbMoreTraversal(GciTravBufType *travBuff); — BoolType via GciNbEndPoll. */
+    public static void GciNbMoreTraversal(MemorySegment buffer) {
+        try {
+            GciNbMoreTraversal.invokeExact(buffer);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** void GciNbPerformTrav(OopType receiver, const char *selector, const OopType *args, int numArgs, GciClampedTravArgsSType *travArgs); — BoolType via GciNbEndPoll. */
+    public static void GciNbPerformTrav(long receiver, String selector, MemorySegment args, int numArgs, MemorySegment travArgs) {
+        try (var a = Arena.ofConfined()) {
+            GciNbPerformTrav.invokeExact(receiver, utf8(a, selector), args, numArgs, travArgs);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** void GciNbStoreTrav(GciTravBufType *travBuff, int flag); — completion via GciNbEndPoll. */
+    public static void GciNbStoreTrav(MemorySegment buffer, int flag) {
+        try {
+            GciNbStoreTrav.invokeExact(buffer, flag);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    /** void GciNbExecuteStrFromContext(const char source[], OopType contextObject, OopType symbolList); — OOP via GciNbEndPoll. */
+    public static void GciNbExecuteStrFromContext(String source, long context, long symbolList) {
+        try (var a = Arena.ofConfined()) {
+            GciNbExecuteStrFromContext.invokeExact(utf8(a, source), context, symbolList);
         } catch (Throwable t) {
             throw rethrow(t);
         }

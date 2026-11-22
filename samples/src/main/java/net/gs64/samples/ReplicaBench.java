@@ -115,9 +115,17 @@ public final class ReplicaBench {
                 case "bigsave" -> bigSave(session, args.length > 1 ? Integer.parseInt(args[1]) : 20_000);
                 default -> {
                     var rounds = mode.equals("load") ? 1 : Integer.parseInt(mode);
+                    // BENCH_BUFFER_KB: traversal buffer (default: the library's choice); BENCH_DEPTH;
+                    // BENCH_SERIAL: no walking, converting and retaining in parallel; BENCH_BY_CLASS: reports per class.
+                    var load = GsLoadOptions.DEFAULT;
+                    if (System.getenv("BENCH_BUFFER_KB") != null) load = load.withBufferSize(Integer.parseInt(System.getenv("BENCH_BUFFER_KB")) * 1024);
+                    if (System.getenv("BENCH_DEPTH") != null) load = load.withDepth(Integer.parseInt(System.getenv("BENCH_DEPTH")));
+                    if (System.getenv("BENCH_SERIAL") != null)
+                        load = load.withWalkDuringTraversal(false).withConvertInParallel(false).withRetainInParallel(false);
+                    if (System.getenv("BENCH_BY_CLASS") != null) load = load.withCountReportsByClass(true);
                     for (var r = 0; r < rounds; r++) {
-                        measure(session, "tracked  ", GsLoadOptions.DEFAULT);
-                        measure(session, "untracked", GsLoadOptions.DEFAULT.withTrackChanges(false));
+                        measure(session, "tracked  ", load);
+                        measure(session, "untracked", load.withTrackChanges(false));
                     }
                 }
             }
@@ -229,6 +237,7 @@ public final class ReplicaBench {
             System.out.printf("%s: %,d objects in %.2f s (load thread CPU %.2f s), %,d GCI calls, %.0f MB heap, walk %.0f ms (checksum %s)%n",
                     label, objects, seconds, cpu / 1e9, session.callCount() - calls, (memAfter - memBefore) / 1e6,
                     (System.nanoTime() - walk) / 1e6, sum);
+            System.out.println("           " + ctx.lastLoad());
             System.out.printf("           GC: %.2f s, %.0f MB allocated by the load thread%n", gc / 1e3, allocated / 1e6);
         }
     }

@@ -23,6 +23,19 @@ public interface SessionAccess {
     /** Per-session state of other parts of the library; use under the lock. */
     Map<String, Object> attachments(GciSession session);
 
+    /**
+     * A traversal that hands the reports of each buffer to {@code onReports} (the list and the index
+     * of the first new report) while the gem fills the next buffer. No GCI call is allowed in it.
+     */
+    net.gs64.gci.GciTraversal traverse(GciSession session, net.gs64.gci.Oop[] roots, int level, net.gs64.gci.GciTraversalOptions options,
+                                       java.util.function.BiConsumer<java.util.List<net.gs64.gci.GciObjectReport>, Integer> onReports);
+
+    /** Nanoseconds the session's traversals have waited for the gem so far. */
+    long traversalWaitNanos(GciSession session);
+
+    /** Whether the calling thread holds the process-wide GCI lock. */
+    boolean holdsLock();
+
     static SessionAccess get() {
         if (Holder.instance == null) {
             try { // initializing GciSession installs the implementation

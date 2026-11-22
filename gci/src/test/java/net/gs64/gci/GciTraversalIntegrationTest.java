@@ -15,6 +15,76 @@ import java.util.stream.IntStream;
 
 class GciTraversalIntegrationTest {
     @StoneTest
+    void theBufferSizeFollowsTheRoundTrip() {
+        try (var s = StoneEnv.login()) {
+            assertTrue(s.roundTrip().toNanos() > 0);
+            assertEquals(s.roundTrip().compareTo(GciSession.LOCAL_ROUND_TRIP_LIMIT) < 0
+                    ? GciTraversalOptions.DEFAULT_BUFFER_SIZE : GciTraversalOptions.NETWORK_BUFFER_SIZE, s.preferredTraversalBufferSize());
+            // Several buffers (double-buffered with GciNbMoreTraversal), then the session is idle again.
+            var t = s.executeTraverse("(1 to: 3000) collect: [:i | i printString]", 2, GciTraversalOptions.DEFAULT.withBufferSize(4096));
+            assertEquals(3001, t.reports().size());
+            assertEquals(7L, s.toValue(s.execute("3 + 4")));
+        }
+    }
+
+    @StoneTest
+    void aTraversalLeavesTheGciFreeWhileTheGemWorks() throws Exception {
+        try (var a = StoneEnv.login(); var b = StoneEnv.login()) {
+            var block = a.execute("[:x | (Delay forMilliseconds: 600) wait. x]");
+            try {
+                var slow = java.util.concurrent.CompletableFuture.supplyAsync(
+                        () -> a.performTraverse(block, "value:", 1, new Oop[] {Oop.fromSmallInteger(7)}, null));
+                Thread.sleep(100); // a's gem is waiting now
+                var start = System.nanoTime();
+                assertEquals(Oop.fromSmallInteger(7), b.execute("3 + 4"));
+                var other = (System.nanoTime() - start) / 1_000_000;
+                assertTrue(!slow.isDone());
+                assertEquals(Oop.fromSmallInteger(7), slow.get().result());
+                assertTrue(other < 300, "the other session waited " + other + " ms");
+            } finally {
+                a.release(block);
+            }
+        }
+    }
+
+    @StoneTest
+    void anotherThreadOnTheSameSessionWaitsForATraversal() throws Exception {
+        try (var a = StoneEnv.login()) {
+            var block = a.execute("[:x | (Delay forMilliseconds: 400) wait. x]");
+            try {
+                var slow = java.util.concurrent.CompletableFuture.supplyAsync(
+                        () -> a.performTraverse(block, "value:", 1, new Oop[] {Oop.fromSmallInteger(5)}, null));
+                Thread.sleep(100);
+                assertEquals(Oop.fromSmallInteger(9), a.execute("4 + 5")); // waits for the traversal, does not fail
+                assertTrue(slow.isDone());
+                assertEquals(Oop.fromSmallInteger(5), slow.get().result());
+            } finally {
+                a.release(block);
+            }
+        }
+    }
+
+    @StoneTest
+    void anExceptionBetweenTwoBuffersDrainsTheTraversal() {
+        try (var s = StoneEnv.login()) {
+            var big = s.execute("(1 to: 20000) collect: [:i | i printString]");
+            try {
+                var buffers = new int[1];
+                // A load cancelled between two buffers ends this way, while the gem fills the next one.
+                assertThrows(java.util.concurrent.CancellationException.class, () -> s.traverse(new Oop[] {big}, 2,
+                        GciTraversalOptions.DEFAULT.withBufferSize(16 * 1024), (reports, first) -> {
+                            if (++buffers[0] == 2) throw new java.util.concurrent.CancellationException();
+                        }));
+                assertEquals(2, buffers[0]);
+                assertEquals(Oop.fromSmallInteger(7), s.execute("3 + 4")); // no call left running
+                assertTrue(s.traverse(big, 2).reports().size() > 20000);
+            } finally {
+                s.release(big);
+            }
+        }
+    }
+
+    @StoneTest
     void smallDoubleEncodesLocallyLikeGciFltToOop() {
         try (var s = StoneEnv.login()) {
             var rnd = new Random(42);

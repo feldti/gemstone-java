@@ -14,6 +14,9 @@ public record GciTraversalOptions(int bufferSize, boolean keepResult, Oop clampS
     /** 64 KB, see {@link #bufferSize()}. */
     public static final int DEFAULT_BUFFER_SIZE = 64 * 1024;
 
+    /** 1 MB: for a stone across a network, where large buffers do not stall (see {@link GciSession#preferredTraversalBufferSize}). */
+    public static final int NETWORK_BUFFER_SIZE = 1024 * 1024;
+
     public static final GciTraversalOptions DEFAULT = new GciTraversalOptions(DEFAULT_BUFFER_SIZE, false, null);
 
     public GciTraversalOptions withBufferSize(int size) {
