@@ -1,5 +1,7 @@
 # Gs64 GCI for Java
 
+**🚧 Work in progress: not ready for production use. 🚧**
+
 Java access to GemStone/S 64 Bit (3.6.5 – 3.7.6) through GemBuilder for C, the classic GCI. It
 uses the Foreign Function and Memory API of Java 22+ (built for Java 25), so it needs no JNI and
 no C code, and Kotlin can use it directly. It is the Java counterpart of the C# library
@@ -20,6 +22,15 @@ try (var session = GciSession.login(net, "DataCurator", "swordfish")) {
 Run the JVM with `--enable-native-access=ALL-UNNAMED`. The GemStone client library is not part
 of this package: set `GEMSTONE` to a GemStone installation (or `GEMSTONE_GCI_LIBRARY` to the
 `libgcirpc` file), or put the library next to the application.
+
+> [!WARNING]
+> **Work in progress.** This project is under active development and not ready for production
+> use. APIs may change without notice, there are no releases or Maven artifacts yet, and some
+> parts are still missing.
+>
+> What exists is covered by integration tests against GemStone 3.6.5 and 3.7.6 on Linux x86-64
+> with Java 25. GemStone 3.6.8, 3.7.2 and 3.7.5, Windows, Linux arm64 and macOS have not been
+> tested yet.
 
 ## Status
 
